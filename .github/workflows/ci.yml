@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+      - name: go vet
+        run: go vet ./...
+      - name: build
+        run: go build ./...
+      # 测试含并发与丢包模拟,-race 用于捕获状态机上的竞态
+      - name: test (race)
+        run: go test -race -count=1 -timeout 10m ./...

@@ -161,6 +161,26 @@ FEC 的价值是**在链路劣化时兜底**,不是提升峰值。值得上的�
 - **小帧效率低** —— 每个 mux 帧头会单独占用一个分片,大量小消息时开销明显
 - 单 UDP 会话,未做多路径/故障切换
 
+## 测试
+
+```bash
+go test -race ./...
+```
+
+回归测试针对开发中实际踩过的坑,每条都做过红灯验证(移除对应修复后测试必然失败):
+
+| 测试 | 覆盖的缺陷 |
+|---|---|
+| `TestPeerRestartRecovery` | 单端重启后序号失同步导致的永久死锁 |
+| `TestTailLossIsRecovered` | 尾部连续丢包无法触发 NACK 的死锁 |
+| `TestHalfCloseKeepsReadDirection` | 把读到 EOF 当成整条连接结束,丢弃对端回程数据 |
+| `TestFECRecoversUnderLoss` | 15% 随机丢包下的字节流完整性 |
+| `TestMuxConcurrentStreamsIsolated` | 多 stream 并发串流 |
+| `TestMuxFrameSpansShards` | 帧跨分片边界解析 |
+| `TestEpochChangeResetsState` | epoch 变化时收发状态重置 |
+
+测试用内置的丢包代理(`lossyProxy`)在本地复现随机丢包与确定性尾部丢包 —— 这几个 bug 只在丢包时才暴露,无丢包环境测不出来。
+
 ## License
 
 [Apache License 2.0](LICENSE)

@@ -38,18 +38,7 @@ func main() {
 	dst := &net.UDPAddr{IP: net.ParseIP(*peer), Port: *uport}
 	sess := newSession(conn, dst, *k, *m, *rate)
 
-	go func() {
-		buf := make([]byte, 2048)
-		for {
-			n, _, err := conn.ReadFromUDP(buf)
-			if err != nil {
-				return
-			}
-			p := make([]byte, n)
-			copy(p, buf[:n])
-			sess.onPacket(p)
-		}
-	}()
+	go sess.readLoop()
 
 	go func() {
 		t := time.NewTicker(30 * time.Second)

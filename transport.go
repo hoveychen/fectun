@@ -182,3 +182,28 @@ func (s *session) pushShard(shard []byte) {
 		s.conn.WriteToUDP(p2, s.peer)
 	}
 }
+
+// readLoop 持续从 UDP 读包并投递给 onPacket。
+// 提取为方法以便测试复用(生产由 main 启动,测试直接调用)。
+func (s *session) readLoop() {
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := s.conn.ReadFromUDP(buf)
+		if err != nil {
+			return
+		}
+		p := make([]byte, n)
+		copy(p, buf[:n])
+		s.onPacket(p)
+	}
+}
+
+// close 停止后台协程(心跳/NACK),测试清理用。
+func (s *session) close() {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	s.conn.Close()
+}
