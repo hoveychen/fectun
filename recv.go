@@ -10,6 +10,7 @@ func (s *session) onPacket(b []byte) {
 	if !ok {
 		return
 	}
+	s.checkEpoch(h.epoch)
 	switch h.typ {
 	case pktHeartbeat:
 		// 对端已发出 h.seq 个分片 → 最大 seq 应为 h.seq-1。
@@ -197,4 +198,43 @@ func (s *session) onNack(seq uint32) {
 	s.stats.Lock()
 	s.stats.retransSent++
 	s.stats.Unlock()
+}
+
+// 检测对端是否重启。对端重启后其 nextSeq 归零,而本端 expected 仍停在旧的高位,
+// 新包会被当作"旧包"丢弃 —— 双方都在正常收发却永久死锁。
+// 收到新 epoch 时,双向重置序号空间并让上层重建连接。
+func (s *session) checkEpoch(e uint32) {
+	if e == 0 {
+		return
+	}
+	s.recvMu.Lock()
+	if s.peerEpoch == 0 {
+		s.peerEpoch = e
+		s.recvMu.Unlock()
+		return
+	}
+	if e == s.peerEpoch {
+		s.recvMu.Unlock()
+		return
+	}
+	// 对端换了 epoch = 对端重启过
+	s.peerEpoch = e
+	s.expected = 0
+	s.maxRecvSeq = 0
+	s.recvBuf = make(map[uint32][]byte)
+	s.groups = make(map[uint32][][]byte)
+	s.groupDone = make(map[uint32]bool)
+	s.firstSeen = make(map[uint32]time.Time)
+	s.recvMu.Unlock()
+
+	// 发送侧同样归零,让对端(其 expected 已是 0)能收到我们的包
+	s.sendMu.Lock()
+	s.nextSeq = 0
+	s.curGroup = nil
+	s.sendBuf = make(map[uint32][]byte)
+	s.sendMu.Unlock()
+
+	if s.onReset != nil {
+		go s.onReset()
+	}
 }

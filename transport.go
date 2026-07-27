@@ -16,6 +16,12 @@ type session struct {
 	k, m int
 	enc  reedsolomon.Encoder
 
+	// 会话 epoch:启动时随机生成。对端重启后 epoch 变化,
+	// 收到新 epoch 即重置序号空间 —— 否则双方 seq 对不上会永久死锁。
+	myEpoch   uint32
+	peerEpoch uint32
+	onReset   func() // 通知上层(mux)关闭所有 stream
+
 	// ---- 发送侧 ----
 	sendMu   sync.Mutex
 	nextSeq  uint32
@@ -55,6 +61,10 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 		closed:    make(chan struct{}),
 		rateBps:   rateMbps * 1e6 / 8,
 		lastFill:  time.Now(),
+	}
+	s.myEpoch = uint32(time.Now().UnixNano())
+	if s.myEpoch == 0 {
+		s.myEpoch = 1
 	}
 	s.tokens = s.rateBps * 0.05
 	go s.heartbeatLoop()
@@ -99,7 +109,7 @@ func (s *session) heartbeatLoop() {
 			next := s.nextSeq
 			s.sendMu.Unlock()
 			// seq 携带"我已发出的分片总数",对端据此判断是否有尾部丢失
-			header{typ: pktHeartbeat, seq: next}.marshal(buf)
+			header{typ: pktHeartbeat, seq: next, epoch: s.myEpoch}.marshal(buf)
 			s.conn.WriteToUDP(buf, s.peer)
 		}
 	}
@@ -147,7 +157,7 @@ func (s *session) pushShard(shard []byte) {
 	// 数据片立即发出(不等整组,降低延迟)
 	pkt := make([]byte, hdrSize+shardPayload)
 	header{typ: pktData, shardIdx: byte(seq % uint32(s.k)), k: byte(s.k), m: byte(s.m),
-		group: group, seq: seq}.marshal(pkt)
+		group: group, seq: seq, epoch: s.myEpoch}.marshal(pkt)
 	copy(pkt[hdrSize:], shard)
 	s.acquire(len(pkt))
 	s.conn.WriteToUDP(pkt, s.peer)
@@ -166,7 +176,7 @@ func (s *session) pushShard(shard []byte) {
 	}
 	for i := s.k; i < s.k+s.m; i++ {
 		p2 := make([]byte, hdrSize+shardPayload)
-		header{typ: pktData, shardIdx: byte(i), k: byte(s.k), m: byte(s.m), group: group}.marshal(p2)
+		header{typ: pktData, shardIdx: byte(i), k: byte(s.k), m: byte(s.m), group: group, epoch: s.myEpoch}.marshal(p2)
 		copy(p2[hdrSize:], shards[i])
 		s.acquire(len(p2))
 		s.conn.WriteToUDP(p2, s.peer)

@@ -42,6 +42,8 @@ type stream struct {
 func newMuxer(s *session, isServer bool, target string) *muxer {
 	m := &muxer{sess: s, isServer: isServer, target: target,
 		streams: make(map[uint32]*stream), nextID: 1}
+	// 对端重启后序号空间已重置,旧 stream 全部失效,必须清掉
+	s.onReset = m.resetAll
 	go m.recvLoop()
 	return m
 }
@@ -203,4 +205,21 @@ func (m *muxer) openStream(c net.Conn) {
 	fmt.Printf("[mux] stream %d 新建(来自 %s)\n", sid, c.RemoteAddr())
 	m.sendFrame(sid, cmdOpen, nil)
 	go st.pumpToTunnel()
+}
+
+// 对端重启:关闭全部 stream。上层(ssh 等)会看到连接断开并自行重连。
+func (m *muxer) resetAll() {
+	m.mu.Lock()
+	old := m.streams
+	m.streams = make(map[uint32]*stream)
+	m.mu.Unlock()
+	for _, st := range old {
+		st.mu.Lock()
+		st.closed = true
+		st.mu.Unlock()
+		st.conn.Close()
+	}
+	if len(old) > 0 {
+		fmt.Printf("[mux] 对端重启,已重置 %d 条 stream\n", len(old))
+	}
 }

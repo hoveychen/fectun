@@ -29,21 +29,21 @@ const (
 //	[3]     m          校验分片数
 //	[4:8]   group      FEC 组号
 //	[8:12]  seq        数据分片全局序号(仅 pktData 的数据片有效)
-//	[12:16] stream     stream id
+//	[12:16] epoch      发送方会话 epoch(启动时随机),用于检测对端重启
 type header struct {
 	typ      byte
 	shardIdx byte
 	k, m     byte
 	group    uint32
 	seq      uint32
-	stream   uint32
+	epoch    uint32
 }
 
 func (h header) marshal(b []byte) {
 	b[0], b[1], b[2], b[3] = h.typ, h.shardIdx, h.k, h.m
 	binary.BigEndian.PutUint32(b[4:8], h.group)
 	binary.BigEndian.PutUint32(b[8:12], h.seq)
-	binary.BigEndian.PutUint32(b[12:16], h.stream)
+	binary.BigEndian.PutUint32(b[12:16], h.epoch)
 }
 
 func parseHeader(b []byte) (h header, ok bool) {
@@ -53,6 +53,6 @@ func parseHeader(b []byte) (h header, ok bool) {
 	h.typ, h.shardIdx, h.k, h.m = b[0], b[1], b[2], b[3]
 	h.group = binary.BigEndian.Uint32(b[4:8])
 	h.seq = binary.BigEndian.Uint32(b[8:12])
-	h.stream = binary.BigEndian.Uint32(b[12:16])
+	h.epoch = binary.BigEndian.Uint32(b[12:16])
 	return h, true
 }
