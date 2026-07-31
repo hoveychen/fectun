@@ -10,6 +10,29 @@ import (
 
 const shardPayload = maxShard - hdrSize // 每分片可承载的字节数
 
+// groupKeepWindow:即使一个组的全部 seq 都已交付,仍保留这么多组的记账,
+// 用来吸收迟到的重传与重复包(它们只会落在最近几个组里)。
+// 超出窗口的组记录必须删除 —— 否则 groupDone 每组一条、永不释放。
+const groupKeepWindow = 128
+
+// sendBufBudgetFor 算出重传缓冲的字节预算:取 1 秒的在途数据量,足以覆盖
+// NACK 的 120ms 缺口判定加一个重传往返。
+//
+// 必须按字节而非包数封顶:原先的"16384 个分片"在 1184 B/片下等于 19.4 MB,
+// 是发送侧常驻内存的主要来源,且这个数字会随 maxShard 变化悄悄漂移。
+// 也必须跟着 -rate 走而不是写死字节数 —— 写死的话高 rate 下预算不足一个
+// NACK 往返的数据量,被请求重传的分片在请求到达前就已淘汰,ARQ 兜底失效。
+func sendBufBudgetFor(rateBps float64) int {
+	b := int(rateBps) // 1 秒
+	if b < 512<<10 {
+		b = 512 << 10
+	}
+	if b > 16<<20 {
+		b = 16 << 20
+	}
+	return b
+}
+
 type session struct {
 	conn *net.UDPConn
 	peer *net.UDPAddr
@@ -27,15 +50,27 @@ type session struct {
 	nextSeq  uint32
 	curGroup []([]byte) // 当前 FEC 组累积的数据分片
 	sendBuf  map[uint32][]byte
-	tokens   float64 // 令牌桶
+	// 重传缓冲的字节账 + 淘汰游标(最老的仍可能在册的 seq)。
+	// 记着字节数才能按 sendBufBudget 封顶;记着游标才能 O(1) 淘汰最老的,
+	// 不必像原先那样每次超限就遍历整个 map。
+	sendBufBytes  int
+	sendBufTail   uint32
+	sendBufBudget int
+	tokens        float64 // 令牌桶
 	lastFill time.Time
 	rateBps  float64
 
 	// ---- 接收侧 ----
-	recvMu    sync.Mutex
-	expected   uint32
-	maxRecvSeq uint32                       // 已见过的最大 seq,避免遍历 map 求最大值
-	recvBuf    map[uint32][]byte            // seq -> 已到达的数据分片
+	recvMu   sync.Mutex
+	expected uint32
+	// recvHigh 是"已知对端发出过的 seq"的开区间上界(= 最大已见 seq + 1)。
+	// 用开区间而非"最大已见 seq":后者初值 0 与"真的见过 seq 0"无法区分,
+	// 会让 NACK 循环把还不存在的 seq 0 当成缺口,空载时无限重传请求。
+	recvHigh uint32
+	// prunedGroup 是记账淘汰游标:组号 < 该值的组已全部交付完毕,
+	// 其 groups/groupDone 记录已被删除,后续再收到这些组的重复包一律忽略。
+	prunedGroup uint32
+	recvBuf     map[uint32][]byte            // seq -> 已到达的数据分片
 	groups    map[uint32][][]byte          // group -> 分片槽位(含校验片)
 	groupDone map[uint32]bool
 	firstSeen map[uint32]time.Time         // seq 缺口首次发现时间,用于 NACK 定时
@@ -62,6 +97,7 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 		rateBps:   rateMbps * 1e6 / 8,
 		lastFill:  time.Now(),
 	}
+	s.sendBufBudget = sendBufBudgetFor(s.rateBps)
 	s.myEpoch = uint32(time.Now().UnixNano())
 	if s.myEpoch == 0 {
 		s.myEpoch = 1
@@ -137,13 +173,14 @@ func (s *session) pushShard(shard []byte) {
 	s.nextSeq++
 	s.curGroup = append(s.curGroup, shard)
 	s.sendBuf[seq] = shard
-	// 发送缓冲上限,防止无限增长
-	if len(s.sendBuf) > 16384 {
-		for k := range s.sendBuf {
-			if k+8192 < seq {
-				delete(s.sendBuf, k)
-			}
+	s.sendBufBytes += len(shard)
+	// 按字节预算淘汰最老的分片。游标只往前走,所以摊还成本是 O(1)。
+	for s.sendBufBytes > s.sendBufBudget && s.sendBufTail < seq {
+		if old, ok := s.sendBuf[s.sendBufTail]; ok {
+			s.sendBufBytes -= len(old)
+			delete(s.sendBuf, s.sendBufTail)
 		}
+		s.sendBufTail++
 	}
 	group := seq / uint32(s.k)
 	full := len(s.curGroup) == s.k
