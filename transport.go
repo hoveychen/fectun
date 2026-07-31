@@ -15,6 +15,17 @@ const shardPayload = maxShard - hdrSize // 每分片可承载的字节数
 // 超出窗口的组记录必须删除 —— 否则 groupDone 每组一条、永不释放。
 const groupKeepWindow = 128
 
+// nackWindow:单次 NACK 缺口扫描最多往 expected 之后看这么多 seq。
+//
+// 没有这个上限,单端重启后 recvHigh 会被对端的旧 nextSeq 一下顶到几百万,
+// nackLoop 首个 tick 就从 expected 一路扫到 recvHigh,给 firstSeen 建几百万条
+// 记录(map[uint32]time.Time 约 40 B/条)—— 2026-07-31 的生产事故里这一项
+// 吃掉 202 MB 常驻内存。
+//
+// 限制窗口不损失能力:ARQ 只需要修补最近的缺口,远处的缺口等 expected 推进
+// 上来后自然进入窗口。
+const nackWindow = 4096
+
 // sendBufBudgetFor 算出重传缓冲的字节预算:取 1 秒的在途数据量,足以覆盖
 // NACK 的 120ms 缺口判定加一个重传往返。
 //

@@ -17,10 +17,27 @@ func (s *session) onPacket(b []byte) {
 		// 没有这一步,尾部丢包时 recvHigh 永远追不上,NACK 不会触发(死锁)。
 		// h.seq==0 表示对端一个分片都没发过,此时不该有任何缺口。
 		s.recvMu.Lock()
+		rolledBack := false
 		if h.seq > s.recvHigh {
 			s.recvHigh = h.seq
+		} else if h.seq+nackWindow < s.recvHigh {
+			// 对端 nextSeq 显著回退 = 对端重置了序号空间。
+			//
+			// 这条不能靠 checkEpoch 兜住:对端是因为收到"我"的新 epoch 才重置的,
+			// 它自己的进程没重启、epoch 没变,所以本端永远看不到 epoch 变化。
+			// 不跟着回退的话 recvHigh 单调停在高位,nackLoop 就永久对一段对端
+			// 根本没发过的高位 seq 发 NACK —— 实测 780 个/秒。
+			//
+			// 阈值取 nackWindow 而非 0:心跳可能乱序到达,一个迟到的旧心跳不该
+			// 触发重置。真正的重置会让差距远超一个窗口。
+			s.resetRecvLocked()
+			s.recvHigh = h.seq
+			rolledBack = true
 		}
 		s.recvMu.Unlock()
+		if rolledBack {
+			s.resetSendAndNotify()
+		}
 		return
 	case pktNack:
 		s.onNack(h.seq)
@@ -184,6 +201,11 @@ func (s *session) nackLoop() {
 		}
 		s.recvMu.Lock()
 		high := s.recvHigh
+		// 窗口上限:对端 seq 再高也只扫最近 nackWindow 个,否则单端重启时
+		// 这个循环会一次性给 firstSeen 建几百万条目(见 nackWindow 注释)。
+		if high > s.expected+nackWindow {
+			high = s.expected + nackWindow
+		}
 		var want []uint32
 		now := time.Now()
 		// 开区间:q < high。recvHigh==0 时循环不执行,空载不会误发 NACK。
@@ -247,6 +269,14 @@ func (s *session) checkEpoch(e uint32) {
 	}
 	// 对端换了 epoch = 对端重启过
 	s.peerEpoch = e
+	s.resetRecvLocked()
+	s.recvMu.Unlock()
+
+	s.resetSendAndNotify()
+}
+
+// resetRecvLocked 把接收侧序号空间与全部记账归零。调用者必须持有 recvMu。
+func (s *session) resetRecvLocked() {
 	s.expected = 0
 	s.recvHigh = 0
 	s.prunedGroup = 0
@@ -254,9 +284,11 @@ func (s *session) checkEpoch(e uint32) {
 	s.groups = make(map[uint32][][]byte)
 	s.groupDone = make(map[uint32]bool)
 	s.firstSeen = make(map[uint32]time.Time)
-	s.recvMu.Unlock()
+}
 
-	// 发送侧同样归零,让对端(其 expected 已是 0)能收到我们的包
+// resetSendAndNotify 把发送侧归零并通知上层重建 stream。
+// 发送侧也要归零,否则对端(其 expected 已是 0)收不到我们的包。
+func (s *session) resetSendAndNotify() {
 	s.sendMu.Lock()
 	s.nextSeq = 0
 	s.curGroup = nil
