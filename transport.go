@@ -78,8 +78,8 @@ type session struct {
 	sendBufTail   uint32
 	sendBufBudget int
 	tokens        float64 // 令牌桶
-	lastFill time.Time
-	rateBps  float64
+	lastFill      time.Time
+	rateBps       float64
 
 	// ---- 接收侧 ----
 	recvMu   sync.Mutex
@@ -93,11 +93,11 @@ type session struct {
 	// prunedGroup 是记账淘汰游标:组号 < 该值的组已全部交付完毕,
 	// 其 groups/groupDone 记录已被删除,后续再收到这些组的重复包一律忽略。
 	prunedGroup uint32
-	recvBuf     map[uint32][]byte            // seq -> 已到达的数据分片
-	groups    map[uint32][][]byte          // group -> 分片槽位(含校验片)
-	groupDone map[uint32]bool
-	firstSeen map[uint32]time.Time         // seq 缺口首次发现时间,用于 NACK 定时
-	deliver   chan []byte
+	recvBuf     map[uint32][]byte   // seq -> 已到达的数据分片
+	groups      map[uint32][][]byte // group -> 分片槽位(含校验片)
+	groupDone   map[uint32]bool
+	firstSeen   map[uint32]time.Time // seq 缺口首次发现时间,用于 NACK 定时
+	deliver     chan []byte
 
 	stats struct {
 		sync.Mutex

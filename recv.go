@@ -93,9 +93,13 @@ func (s *session) onPacket(b []byte) {
 		}
 	}
 	s.tryRecover(h.group)
-	s.drain()
+	ready := s.drainLocked()
 	s.pruneGroups()
 	s.recvMu.Unlock()
+
+	// 交付必须在锁外:deliver 满时这里会阻塞,而 nackLoop 还要拿 recvMu。
+	// 从前 drain 持锁写 channel,一条下游 TCP 写阻塞就把整个接收侧拘死。
+	s.deliverAll(ready)
 }
 
 // pruneGroups 淘汰"整组 seq 都已低于 expected"的组记账。
@@ -168,11 +172,15 @@ func (s *session) tryRecover(group uint32) {
 }
 
 // 按序交付连续到达的分片
-func (s *session) drain() {
+// drainLocked 取出连续到达的分片、推进 expected,并把待交付的字节按序收集返回。
+// 它自己不往 deliver 写 —— 写 channel 会阻塞,而这里持着 recvMu。
+// 调用者必须持有 recvMu,并在释放锁之后调 deliverAll。
+func (s *session) drainLocked() [][]byte {
+	var ready [][]byte
 	for {
 		sh := s.recvBuf[s.expected]
 		if sh == nil {
-			return
+			return ready
 		}
 		delete(s.recvBuf, s.expected)
 		delete(s.firstSeen, s.expected)
@@ -186,6 +194,16 @@ func (s *session) drain() {
 		}
 		out := make([]byte, n)
 		copy(out, sh[2:2+n])
+		ready = append(ready, out)
+	}
+}
+
+// deliverAll 按序把 drainLocked 收集的字节交给上层。必须在锁外调用。
+// 顺序性由调用方保证:onPacket 只由单个 readLoop goroutine 串行调用,
+// 所以收集与交付都是串行的,字节流顺序不会乱。
+// 这里阻塞是正确的背压 —— UDP 包会在内核缓冲排队,而 recvMu 是空闲的。
+func (s *session) deliverAll(ready [][]byte) {
+	for _, out := range ready {
 		select {
 		case s.deliver <- out:
 		case <-s.closed:

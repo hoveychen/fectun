@@ -14,8 +14,39 @@ const (
 	cmdOpen     = 1
 	cmdClose    = 2
 	cmdShutdown = 3 // 半关闭:我不再发数据,但仍要接收(TCP 允许单向关闭)
+	cmdWindow   = 4 // 逐 stream 流控:payload 4 字节 = 累计已消费字节数
 	frameHdr    = 7
 )
+
+// streamWindow:每条 stream 允许的"已发出但对端尚未消费"的字节上限。
+//
+// 有了这个上限,接收侧的写队列就永远不会溢出 —— 这是"可靠字节流 + 内存有界 +
+// 一条慢 stream 不影响其他 stream"三者同时成立的唯一办法。少了流控,三者必舍其一:
+// 队列满了阻塞就卡住别人,满了丢弃就撕坏字节流,不设上限就是无界内存。
+const streamWindow = 256 << 10
+
+// streamQueueDepth:接收侧每条 stream 的写队列深度(帧数)。
+// pumpToTunnel 按 8 KB 切帧,streamWindow/8KB = 32 帧,取 48 留余量。
+// 对端守窗口时这个队列不会满。
+const streamQueueDepth = 48
+
+// windowUpdateThreshold:累计消费超过这么多字节就回一个窗口更新帧。
+// 取窗口的一半:既不会每帧都回(白占隧道带宽),又能让发送方始终有额度。
+const windowUpdateThreshold = streamWindow / 2
+
+// 写队列元素。关闭动作也当成队列元素排进去,这样它一定排在此前的数据之后 ——
+// 直接关连接会把队列里尚未写出的数据丢掉(加队列后踩过:半关闭恰好在 48 帧
+// 队列深度上截断了数据)。
+const (
+	wqData     = 0 // 普通数据
+	wqShutdown = 1 // 排空后关写方向(半关闭)
+	wqClose    = 2 // 排空后整条关闭
+)
+
+type wqItem struct {
+	kind byte
+	data []byte
+}
 
 type muxer struct {
 	sess     *session
@@ -37,6 +68,22 @@ type stream struct {
 	sentEOF bool // 本端已读完,已通知对端
 	recvEOF bool // 对端已读完
 	mu      sync.Mutex
+
+	// ---- 接收侧:写队列 ----
+	// dispatch 只入队,由 writeLoop 落到下游 TCP。这样某条 stream 的下游写阻塞
+	// 不会卡住 mux.recvLoop,其他 stream 照常交付。
+	wq   chan wqItem   // 数据与关闭动作都走这里,保证按序、且关闭前队列已排空
+	done chan struct{} // stream 已关闭,唤醒 writeLoop 与等窗口的发送方
+
+	// ---- 流控记账 ----
+	// 全是"累计字节数",允许 uint32 绕回:in-flight 由 sent-acked 的 uint32 减法
+	// 算出,只要它小于 2^31 就正确 —— 而它受 streamWindow(256 KB)约束。
+	wmu      sync.Mutex
+	sent     uint32        // 本端已发出的字节数
+	acked    uint32        // 对端已消费的字节数(由 cmdWindow 更新)
+	wnd      chan struct{} // 窗口出现额度时唤醒等待者(容量 1)
+	consumed uint32        // 本端已写入下游的字节数
+	lastAck  uint32        // 上次通告出去的 consumed
 }
 
 func newMuxer(s *session, isServer bool, target string) *muxer {
@@ -46,6 +93,16 @@ func newMuxer(s *session, isServer bool, target string) *muxer {
 	s.onReset = m.resetAll
 	go m.recvLoop()
 	return m
+}
+
+func newStream(m *muxer, sid uint32, c net.Conn) *stream {
+	st := &stream{id: sid, conn: c, mux: m,
+		wq:   make(chan wqItem, streamQueueDepth),
+		done: make(chan struct{}),
+		wnd:  make(chan struct{}, 1),
+	}
+	go st.writeLoop()
+	return st
 }
 
 func (m *muxer) sendFrame(sid uint32, cmd byte, data []byte) {
@@ -89,6 +146,12 @@ func (m *muxer) recvLoop() {
 	}
 }
 
+func (m *muxer) lookup(sid uint32) *stream {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.streams[sid]
+}
+
 func (m *muxer) dispatch(sid uint32, cmd byte, payload []byte) {
 	switch cmd {
 	case cmdOpen:
@@ -101,37 +164,38 @@ func (m *muxer) dispatch(sid uint32, cmd byte, payload []byte) {
 			m.sendFrame(sid, cmdClose, nil)
 			return
 		}
-		st := &stream{id: sid, conn: c, mux: m}
+		st := newStream(m, sid, c)
 		m.mu.Lock()
 		m.streams[sid] = st
 		m.mu.Unlock()
 		fmt.Printf("[mux] stream %d 已连接 %s\n", sid, m.target)
 		go st.pumpToTunnel()
 	case cmdData:
-		m.mu.Lock()
-		st := m.streams[sid]
-		m.mu.Unlock()
-		if st != nil {
-			st.conn.Write(payload)
+		// 只入队,绝不在这里同步 Write —— 那会让 recvLoop 停摆,
+		// 一条 stream 的下游写阻塞就拖垮整条隧道的所有 stream。
+		if st := m.lookup(sid); st != nil {
+			st.enqueue(wqItem{kind: wqData, data: payload})
+		}
+	case cmdWindow:
+		if len(payload) < 4 {
+			return
+		}
+		if st := m.lookup(sid); st != nil {
+			st.onWindowUpdate(binary.BigEndian.Uint32(payload))
 		}
 	case cmdShutdown:
-		m.mu.Lock()
-		st := m.streams[sid]
-		m.mu.Unlock()
+		st := m.lookup(sid)
 		if st == nil {
 			return
 		}
-		// 对端不再发数据 → 关闭本地连接的写方向,让下游看到 EOF
-		if tc, ok := st.conn.(*net.TCPConn); ok {
-			tc.CloseWrite()
-		}
+		// 先记下 recvEOF,再排入哨兵 —— writeLoop 取到哨兵时要读这个标志
+		// 来判断两个方向是否都结束了。
 		st.mu.Lock()
 		st.recvEOF = true
-		both := st.sentEOF && st.recvEOF
 		st.mu.Unlock()
-		if both {
-			st.close(false)
-		}
+		// 排队而不是立刻 CloseWrite/close:队列里可能还有没写出的数据,
+		// 直接动连接会把它们丢掉。收尾由 writeLoop 在排空后做。
+		st.enqueue(wqItem{kind: wqShutdown})
 	case cmdClose:
 		m.mu.Lock()
 		st := m.streams[sid]
@@ -140,6 +204,104 @@ func (m *muxer) dispatch(sid uint32, cmd byte, payload []byte) {
 		if st != nil {
 			st.close(false)
 		}
+	}
+}
+
+// enqueue 把一个元素交给该 stream 的写队列。
+// 对端守窗口时数据不会把队列填满;真满了说明对端没守(例如未升级的旧版本),
+// 此时宁可阻塞也不能丢 —— 隧道承载的是可靠字节流,丢一帧就撕坏整条流。
+func (s *stream) enqueue(it wqItem) {
+	select {
+	case s.wq <- it:
+	case <-s.done:
+	}
+}
+
+// writeLoop 把队列里的数据落到下游 TCP,并回送窗口更新。
+// 独立 goroutine 是关键:下游写阻塞时只停这一条 stream,mux.recvLoop 不受影响。
+// 关闭动作也从队列里取,所以关闭一定发生在此前所有数据都写出之后。
+func (s *stream) writeLoop() {
+	for {
+		var it wqItem
+		select {
+		case it = <-s.wq:
+		case <-s.done:
+			return
+		}
+		switch it.kind {
+		case wqShutdown:
+			// 队列已排到这里,说明此前的数据都写出去了,现在才关写方向
+			if tc, ok := s.conn.(*net.TCPConn); ok {
+				tc.CloseWrite()
+			}
+			// 若本端也早已读完,两个方向都结束了,整条可以收掉
+			s.mu.Lock()
+			both := s.sentEOF && s.recvEOF
+			s.mu.Unlock()
+			if both {
+				s.close(false)
+				return
+			}
+		case wqClose:
+			s.close(false)
+			return
+		default:
+			if _, err := s.conn.Write(it.data); err != nil {
+				s.close(true)
+				return
+			}
+			s.ackConsumed(len(it.data))
+		}
+	}
+}
+
+// ackConsumed 累计已写入下游的字节数,过阈值就通告对端,让它继续有额度。
+func (s *stream) ackConsumed(n int) {
+	s.wmu.Lock()
+	s.consumed += uint32(n)
+	cur := s.consumed
+	need := cur-s.lastAck >= windowUpdateThreshold
+	if need {
+		s.lastAck = cur
+	}
+	s.wmu.Unlock()
+	if need {
+		var b [4]byte
+		binary.BigEndian.PutUint32(b[:], cur)
+		s.mux.sendFrame(s.id, cmdWindow, b[:])
+	}
+}
+
+// reserve 为即将发出的 n 字节申请窗口额度,额度不足就等对端的窗口更新。
+// 返回 false 表示 stream 已关闭,调用方应停止发送。
+func (s *stream) reserve(n int) bool {
+	for {
+		s.wmu.Lock()
+		if s.sent-s.acked+uint32(n) <= streamWindow {
+			s.sent += uint32(n)
+			s.wmu.Unlock()
+			return true
+		}
+		s.wmu.Unlock()
+		select {
+		case <-s.wnd:
+		case <-s.done:
+			return false
+		}
+	}
+}
+
+// onWindowUpdate 记下对端已消费到哪,并唤醒可能在等额度的发送方。
+func (s *stream) onWindowUpdate(consumed uint32) {
+	s.wmu.Lock()
+	// uint32 减法判断是否前进,天然处理绕回;倒退的通告(乱序)忽略
+	if consumed-s.acked < 1<<31 {
+		s.acked = consumed
+	}
+	s.wmu.Unlock()
+	select {
+	case s.wnd <- struct{}{}:
+	default:
 	}
 }
 
@@ -155,6 +317,10 @@ func (s *stream) pumpToTunnel() {
 				if end > n {
 					end = n
 				}
+				// 先申请窗口额度:不超发,对端的写队列就不会溢出
+				if !s.reserve(end - off) {
+					return
+				}
 				s.mux.sendFrame(s.id, cmdData, buf[off:end])
 			}
 		}
@@ -169,7 +335,9 @@ func (s *stream) pumpToTunnel() {
 				s.mux.sendFrame(s.id, cmdShutdown, nil)
 			}
 			if both {
-				s.close(false)
+				// 走队列:对端的数据可能还排在写队列里没落地,
+				// 直接 close 会把它们丢掉。
+				s.enqueue(wqItem{kind: wqClose})
 			}
 			return
 		}
@@ -183,6 +351,7 @@ func (s *stream) close(notify bool) {
 		return
 	}
 	s.closed = true
+	close(s.done) // 唤醒 writeLoop 和所有在等窗口额度的发送方
 	s.mu.Unlock()
 	s.conn.Close()
 	s.mux.mu.Lock()
@@ -199,7 +368,7 @@ func (m *muxer) openStream(c net.Conn) {
 	m.mu.Lock()
 	sid := m.nextID
 	m.nextID++
-	st := &stream{id: sid, conn: c, mux: m}
+	st := newStream(m, sid, c)
 	m.streams[sid] = st
 	m.mu.Unlock()
 	fmt.Printf("[mux] stream %d 新建(来自 %s)\n", sid, c.RemoteAddr())
@@ -215,7 +384,10 @@ func (m *muxer) resetAll() {
 	m.mu.Unlock()
 	for _, st := range old {
 		st.mu.Lock()
-		st.closed = true
+		if !st.closed {
+			st.closed = true
+			close(st.done) // 必须关:否则 writeLoop 与等窗口的发送方永久泄漏
+		}
 		st.mu.Unlock()
 		st.conn.Close()
 	}
