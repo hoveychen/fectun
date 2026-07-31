@@ -174,6 +174,83 @@ func TestIdleSessionSendsNoNack(t *testing.T) {
 	}
 }
 
+// heartbeatPkt 拼一个心跳包。seq 字段携带发送端已发出的分片总数。
+func heartbeatPkt(seq, epoch uint32) []byte {
+	b := make([]byte, hdrSize)
+	header{typ: pktHeartbeat, seq: seq, epoch: epoch}.marshal(b)
+	return b
+}
+
+// 回归:对端 nextSeq 在高位时,本端的 NACK 记账不得爆炸。
+// 这是 2026-07-31 生产事故的复现 —— 单端重启后重启方 expected=0,而对端已跑
+// 4 天、nextSeq 在几百万的高位。对端心跳把 recvHigh 一下顶到高位,nackLoop
+// 首个 tick 就从 0 一路扫到 recvHigh,给 firstSeen 建了几百万条目
+// (map[uint32]time.Time 约 40 B/条),实测吃掉 202 MB 常驻并每秒发 780 个 NACK。
+func TestHugePeerSeqDoesNotExplodeNackState(t *testing.T) {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, 20, 15, 25)
+	defer s.close()
+
+	// 对端心跳声称已发出 50 万个分片,而本端 expected 还是 0
+	const peerNext = 500000
+	s.onPacket(heartbeatPkt(peerNext, 7))
+
+	// 让 nackLoop(40ms 一跳)跑几轮
+	time.Sleep(250 * time.Millisecond)
+
+	s.recvMu.Lock()
+	seen, high := len(s.firstSeen), s.recvHigh
+	s.recvMu.Unlock()
+
+	if high == 0 {
+		t.Fatal("前置条件不成立:心跳没把 recvHigh 顶起来,测试无效")
+	}
+	// 记账条目数必须与"最近的缺口窗口"同阶,不能与对端 seq 同阶
+	if seen > 8192 {
+		t.Fatalf("firstSeen 爆炸:%d 条(对端 seq=%d)—— 单次扫描没有窗口上限", seen, peerNext)
+	}
+}
+
+// 回归:对端序号空间回退时,本端必须跟着重置。
+// 关键时序 —— A 重启(换新 epoch),B 收到新 epoch 后重置自己的 nextSeq 归零,
+// 但 B 进程没重启、B 自己的 epoch 不变。于是 A 的 checkEpoch 永远察觉不到
+// B 已经重置,recvHigh 单调递增停在高位,nackLoop 就永久对一段 B 根本没发过的
+// 高位 seq 发 NACK(实测 780 个/秒)。
+func TestPeerSeqRollbackResetsRecvState(t *testing.T) {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, 20, 15, 25)
+	defer s.close()
+
+	// 对端在高位(epoch 固定为 7,全程不变 —— 对端进程并没有重启)
+	s.onPacket(heartbeatPkt(300000, 7))
+	s.recvMu.Lock()
+	highBefore := s.recvHigh
+	s.recvMu.Unlock()
+	if highBefore != 300000 {
+		t.Fatalf("前置条件不成立:recvHigh=%d,应为 300000", highBefore)
+	}
+
+	// 对端重置了序号空间,心跳回到低位。epoch 没变。
+	s.onPacket(heartbeatPkt(3, 7))
+
+	s.recvMu.Lock()
+	high, exp := s.recvHigh, s.expected
+	s.recvMu.Unlock()
+
+	if high > 3 {
+		t.Fatalf("recvHigh 没跟随对端回退:%d(对端已回到 3)—— 会永久对高位 seq 发 NACK", high)
+	}
+	if exp != 0 {
+		t.Fatalf("对端序号空间已重置,本端 expected 应归零,实为 %d", exp)
+	}
+}
+
 // dataShardPkt 拼一个合法的数据分片包,payload 前两字节是有效长度。
 func dataShardPkt(group uint32, idx, k, m int, epoch uint32) []byte {
 	pkt := make([]byte, hdrSize+shardPayload)
