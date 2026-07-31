@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"net"
 	"sync"
 	"testing"
@@ -510,4 +511,53 @@ func TestMuxConcurrentStreamsIsolated(t *testing.T) {
 			t.Fatalf("stream %d 失败: %s", i, e)
 		}
 	}
+}
+
+// 回归:对端重启时,recvLoop 的帧缓冲必须一并清空。
+//
+// 2026-07-31 生产事故 —— ko 侧 fectun 重启后,sz 侧确实打印了
+// "[mux] 对端重启,已重置 N 条 stream",新 stream 也照常建立,隧道却再也不通,
+// 实测 >=2 分钟未自愈,最后靠手工重启进程才恢复。
+//
+// 根因:recvLoop 的 buf 是它自己的局部变量,resetAll 够不着。对端重启的瞬间
+// buf 里若卡着半个帧(帧头 7 字节没收全,或声明的 payload 还没到齐),重启后
+// 从干净字节流重发的第一个帧就会被拼到这段残帧尾部 —— 此后每个帧头都从错
+// 位的偏移解析,sid/cmd/length 全是垃圾,字节流被永久撕坏。而局部变量只有
+// 进程重启才会消失,这正是"必须手工 restart 才恢复"的原因。
+func TestResetClearsFrameBuffer(t *testing.T) {
+	echoAddr, stopEcho := startEcho(t)
+	defer stopEcho()
+
+	px := newLossyProxy(t, 0, 77)
+	defer px.stop()
+	srvSess := newTestSession(t, px.port(), 20, 15, 500)
+	defer srvSess.close()
+	srvMux := newMuxer(srvSess, true, echoAddr)
+
+	// 1. 对端重启前:一个被截断的帧卡在 recvLoop 的 buf 里。
+	//    帧头要 7 字节,这里只送 3 字节,recvLoop 会 break 出内层循环等后续字节。
+	srvSess.deliver <- []byte{0xAA, 0xBB, 0xCC}
+	time.Sleep(100 * time.Millisecond)
+
+	// 2. 对端重启 → session 层重置序号空间 → onReset → resetAll
+	srvMux.resetAll()
+	time.Sleep(50 * time.Millisecond)
+
+	// 3. 重启后对端从干净的字节流重新开始:一个完整的 cmdOpen(sid=42)
+	const wantSID = 42
+	frame := make([]byte, frameHdr)
+	binary.BigEndian.PutUint32(frame[0:4], wantSID)
+	frame[4] = cmdOpen
+	binary.BigEndian.PutUint16(frame[5:7], 0)
+	srvSess.deliver <- frame
+
+	// 4. server 侧应据此连上 target 并登记 stream 42
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if srvMux.lookup(wantSID) != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("对端重启后 cmdOpen(sid=%d) 未被正确解析 —— 残留的半帧把帧边界撕错了", wantSID)
 }

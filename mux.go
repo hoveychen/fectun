@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -99,6 +100,10 @@ type muxer struct {
 	window     uint32
 	ackEvery   uint32 // 累计消费多少字节就回一次窗口更新
 	queueDepth int    // 接收侧写队列深度(帧数)
+
+	// recvLoop 帧缓冲的代际。resetAll 递增它,recvLoop 据此丢掉卡在半路的
+	// 残帧 —— 缓冲是 recvLoop 的局部变量,除此之外没有别的办法够到它。
+	resetGen atomic.Uint64
 }
 
 type stream struct {
@@ -172,9 +177,16 @@ func (m *muxer) sendFrame(sid uint32, cmd byte, data []byte) {
 // 从可靠层持续读字节流,切出帧并分发
 func (m *muxer) recvLoop() {
 	var buf []byte
+	gen := m.resetGen.Load()
 	for {
 		select {
 		case p := <-m.sess.deliver:
+			// 对端重启后字节流从头开始,此前卡在 buf 里的半个帧已经没有下文了。
+			// 不丢掉的话新字节会被拼到残帧尾部,此后每个帧头都从错位的偏移解析。
+			if g := m.resetGen.Load(); g != gen {
+				gen = g
+				buf = buf[:0]
+			}
 			buf = append(buf, p...)
 		case <-m.sess.closed:
 			return
@@ -447,7 +459,14 @@ func (m *muxer) openStream(c net.Conn) {
 }
 
 // 对端重启:关闭全部 stream。上层(ssh 等)会看到连接断开并自行重连。
+//
+// 递增 resetGen 让 recvLoop 丢掉半路的残帧。少了这一步,光关 stream 是不够的:
+// 2026-07-31 生产事故里 ko 侧重启后,sz 侧照常打印"已重置 N 条 stream"、新
+// stream 也照常建立,隧道却再没通过 —— 因为残帧还卡在 recvLoop 的局部缓冲里,
+// 重启后的新字节被拼在它后面,帧边界永久错位。局部变量只有进程重启才会消失,
+// 这就是当时"必须手工 restart 才恢复"的原因。
 func (m *muxer) resetAll() {
+	m.resetGen.Add(1)
 	m.mu.Lock()
 	old := m.streams
 	m.streams = make(map[uint32]*stream)
