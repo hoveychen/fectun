@@ -236,8 +236,11 @@ func TestPeerSeqRollbackResetsRecvState(t *testing.T) {
 		t.Fatalf("前置条件不成立:recvHigh=%d,应为 300000", highBefore)
 	}
 
-	// 对端重置了序号空间,心跳回到低位。epoch 没变。
-	s.onPacket(heartbeatPkt(3, 7))
+	// 对端重置了序号空间,心跳持续回到低位。epoch 没变。
+	// 判定需要连续多个心跳都报更低值(单个低心跳可能只是乱序)。
+	for i := 0; i < 3; i++ {
+		s.onPacket(heartbeatPkt(3, 7))
+	}
 
 	s.recvMu.Lock()
 	high, exp := s.recvHigh, s.expected
@@ -248,6 +251,66 @@ func TestPeerSeqRollbackResetsRecvState(t *testing.T) {
 	}
 	if exp != 0 {
 		t.Fatalf("对端序号空间已重置,本端 expected 应归零,实为 %d", exp)
+	}
+}
+
+// 回归:小幅度的序号回退也必须能接住。
+// 这是 2026-07-31 第二次生产故障的复现 —— 我给回退判据定了个"幅度要超过
+// nackWindow(4096)"的阈值,而抓包看到的真实回退幅度只有 65 → 0,判据永远不
+// 触发,两端各自死等一段对方已经不存在的 seq,持续发无效 NACK。
+// 回退幅度取决于对端重启前发了多少分片,可以小到几十 —— 判据不能依赖幅度。
+func TestSmallSeqRollbackIsDetected(t *testing.T) {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, 20, 15, 25)
+	defer s.close()
+
+	// 对端只发过 65 个分片就重置了 —— 这是生产上的真实数值
+	s.onPacket(heartbeatPkt(65, 7))
+	s.recvMu.Lock()
+	highBefore := s.recvHigh
+	s.recvMu.Unlock()
+	if highBefore != 65 {
+		t.Fatalf("前置条件不成立:recvHigh=%d,应为 65", highBefore)
+	}
+
+	for i := 0; i < 3; i++ {
+		s.onPacket(heartbeatPkt(0, 7))
+	}
+
+	s.recvMu.Lock()
+	high, exp := s.recvHigh, s.expected
+	s.recvMu.Unlock()
+
+	if high != 0 {
+		t.Fatalf("小幅回退没被接住:recvHigh=%d(对端已回到 0)—— 判据依赖了回退幅度", high)
+	}
+	if exp != 0 {
+		t.Fatalf("expected 应归零,实为 %d", exp)
+	}
+}
+
+// 单个迟到的旧心跳不得触发重置 —— 否则一次 UDP 乱序就会白拆一条正常连接。
+func TestSingleLowHeartbeatDoesNotReset(t *testing.T) {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, 20, 15, 25)
+	defer s.close()
+
+	s.onPacket(heartbeatPkt(300000, 7))
+	// 一个迟到的旧心跳(幅度再大也只是乱序),随后正常心跳继续
+	s.onPacket(heartbeatPkt(3, 7))
+
+	s.recvMu.Lock()
+	high := s.recvHigh
+	s.recvMu.Unlock()
+
+	if high != 300000 {
+		t.Fatalf("单个低心跳就触发了重置:recvHigh=%d —— 一次 UDP 乱序会白拆连接", high)
 	}
 }
 

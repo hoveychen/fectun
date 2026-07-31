@@ -26,6 +26,16 @@ const groupKeepWindow = 128
 // 上来后自然进入窗口。
 const nackWindow = 4096
 
+// lowHbResetStreak:连续多少个心跳报告更低的 nextSeq,才判定对端重置了序号空间。
+//
+// 判据不能用"回退幅度"—— 幅度取决于对端重置前发过多少分片,2026-07-31 生产上
+// 实测只有 65 → 0。之前拿 nackWindow(4096) 当幅度阈值,导致判据永不触发,两端
+// 各自死等一段对方已不存在的 seq。
+//
+// 改用连续次数:心跳 100ms 一个,3 次 = 300ms。UDP 乱序不会持续这么久(一个迟到
+// 的旧心跳只会偶发报低值),而真正的重置会一直报低值。
+const lowHbResetStreak = 3
+
 // sendBufBudgetFor 算出重传缓冲的字节预算:取 1 秒的在途数据量,足以覆盖
 // NACK 的 120ms 缺口判定加一个重传往返。
 //
@@ -78,6 +88,8 @@ type session struct {
 	// 用开区间而非"最大已见 seq":后者初值 0 与"真的见过 seq 0"无法区分,
 	// 会让 NACK 循环把还不存在的 seq 0 当成缺口,空载时无限重传请求。
 	recvHigh uint32
+	// lowHbStreak 是"连续收到多少个报告更低 nextSeq 的心跳"。见 lowHbResetStreak。
+	lowHbStreak int
 	// prunedGroup 是记账淘汰游标:组号 < 该值的组已全部交付完毕,
 	// 其 groups/groupDone 记录已被删除,后续再收到这些组的重复包一律忽略。
 	prunedGroup uint32

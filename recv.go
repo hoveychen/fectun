@@ -18,21 +18,27 @@ func (s *session) onPacket(b []byte) {
 		// h.seq==0 表示对端一个分片都没发过,此时不该有任何缺口。
 		s.recvMu.Lock()
 		rolledBack := false
-		if h.seq > s.recvHigh {
+		switch {
+		case h.seq > s.recvHigh:
 			s.recvHigh = h.seq
-		} else if h.seq+nackWindow < s.recvHigh {
-			// 对端 nextSeq 显著回退 = 对端重置了序号空间。
+			s.lowHbStreak = 0
+		case h.seq < s.recvHigh:
+			// 对端报告的 nextSeq 低于本端已知上界。两种可能:心跳乱序(偶发),
+			// 或对端重置了序号空间(持续)。用连续次数区分,不用回退幅度 ——
+			// 幅度可以小到几十,见 lowHbResetStreak。
 			//
-			// 这条不能靠 checkEpoch 兜住:对端是因为收到"我"的新 epoch 才重置的,
-			// 它自己的进程没重启、epoch 没变,所以本端永远看不到 epoch 变化。
-			// 不跟着回退的话 recvHigh 单调停在高位,nackLoop 就永久对一段对端
-			// 根本没发过的高位 seq 发 NACK —— 实测 780 个/秒。
-			//
-			// 阈值取 nackWindow 而非 0:心跳可能乱序到达,一个迟到的旧心跳不该
-			// 触发重置。真正的重置会让差距远超一个窗口。
-			s.resetRecvLocked()
-			s.recvHigh = h.seq
-			rolledBack = true
+			// 这条不能靠 checkEpoch 兜住:对端是因为收到"我"的新 epoch 才重置
+			// 序号的,它自己的进程没重启、epoch 没变,所以本端永远看不到 epoch
+			// 变化。不跟着回退的话 recvHigh 停在高位,nackLoop 就永久对一段对端
+			// 根本没发过的 seq 发 NACK —— 实测 780 个/秒。
+			s.lowHbStreak++
+			if s.lowHbStreak >= lowHbResetStreak {
+				s.resetRecvLocked()
+				s.recvHigh = h.seq
+				rolledBack = true
+			}
+		default:
+			s.lowHbStreak = 0
 		}
 		s.recvMu.Unlock()
 		if rolledBack {
@@ -279,6 +285,7 @@ func (s *session) checkEpoch(e uint32) {
 func (s *session) resetRecvLocked() {
 	s.expected = 0
 	s.recvHigh = 0
+	s.lowHbStreak = 0
 	s.prunedGroup = 0
 	s.recvBuf = make(map[uint32][]byte)
 	s.groups = make(map[uint32][][]byte)
