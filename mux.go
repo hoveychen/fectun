@@ -19,17 +19,42 @@ const (
 	frameHdr    = 7
 )
 
-// streamWindow:每条 stream 允许的"已发出但对端尚未消费"的字节上限。
+// 每条 stream 的流控窗口 = "已发出但对端尚未消费"的字节上限。
 //
 // 有了这个上限,接收侧的写队列就永远不会溢出 —— 这是"可靠字节流 + 内存有界 +
 // 一条慢 stream 不影响其他 stream"三者同时成立的唯一办法。少了流控,三者必舍其一:
 // 队列满了阻塞就卡住别人,满了丢弃就撕坏字节流,不设上限就是无界内存。
-const streamWindow = 256 << 10
+//
+// 窗口必须跟着 -rate 走,不能写死。单条 stream 的吞吐上限 = window / RTT:
+// 实测 rate=25、RTT=170ms 时,固定 256 KB 窗口把吞吐压到 12.0 Mbps
+// (理论 256KB/170ms = 12.3),而净上限是 14.3 —— 已经开始约束。rate 调高后
+// 固定窗口就会变成严重瓶颈(rate=60 净 34 Mbps,256KB/170ms 只够 12 Mbps)。
+const (
+	// windowSpan:窗口按"多少秒的在途数据"来定。覆盖到 RTT 200ms 的链路,
+	// 同时不让每条 stream 的接收队列上限失控。
+	windowSpan   = 0.2
+	minStreamWin = 128 << 10
+	maxStreamWin = 4 << 20
+	// frameChunk:pumpToTunnel 的切帧大小,队列深度按它换算。
+	frameChunk = 8192
+)
 
-// streamQueueDepth:接收侧每条 stream 的写队列深度(帧数)。
-// pumpToTunnel 按 8 KB 切帧,streamWindow/8KB = 32 帧,取 48 留余量。
-// 对端守窗口时这个队列不会满。
-const streamQueueDepth = 48
+// streamWindowFor 按线路速率与 FEC 冗余度算出每条 stream 的窗口字节数。
+// 用净速率(扣掉 m/k 冗余)而非线路速率 —— 冗余分片不承载用户数据。
+func streamWindowFor(rateBps float64, k, m int) uint32 {
+	netBps := rateBps
+	if k > 0 {
+		netBps = rateBps / (1 + float64(m)/float64(k))
+	}
+	w := int(netBps * windowSpan)
+	if w < minStreamWin {
+		w = minStreamWin
+	}
+	if w > maxStreamWin {
+		w = maxStreamWin
+	}
+	return uint32(w)
+}
 
 // halfCloseLinger:本端已读完(sentEOF)、但对端迟迟不回 cmdShutdown 时,最多再等多久。
 //
@@ -42,9 +67,8 @@ const streamQueueDepth = 48
 // 是变量而非常量:测试要把它调短。
 var halfCloseLinger = 60 * time.Second
 
-// windowUpdateThreshold:累计消费超过这么多字节就回一个窗口更新帧。
-// 取窗口的一半:既不会每帧都回(白占隧道带宽),又能让发送方始终有额度。
-const windowUpdateThreshold = streamWindow / 2
+// 累计消费超过窗口的一半就回一个窗口更新帧:既不会每帧都回(白占隧道带宽),
+// 又能让发送方始终有额度。
 
 // 写队列元素。关闭动作也当成队列元素排进去,这样它一定排在此前的数据之后 ——
 // 直接关连接会把队列里尚未写出的数据丢掉(加队列后踩过:半关闭恰好在 48 帧
@@ -70,6 +94,11 @@ type muxer struct {
 	nextID  uint32
 	// 发送侧串行化:可靠层要求帧字节连续不交错
 	writeMu sync.Mutex
+
+	// 流控参数,由 session 的速率与冗余度算出(见 streamWindowFor)
+	window     uint32
+	ackEvery   uint32 // 累计消费多少字节就回一次窗口更新
+	queueDepth int    // 接收侧写队列深度(帧数)
 }
 
 type stream struct {
@@ -89,18 +118,26 @@ type stream struct {
 
 	// ---- 流控记账 ----
 	// 全是"累计字节数",允许 uint32 绕回:in-flight 由 sent-acked 的 uint32 减法
-	// 算出,只要它小于 2^31 就正确 —— 而它受 streamWindow(256 KB)约束。
+	// 算出,只要它小于 2^31 就正确 —— 而它受 window(最大 4 MB)约束。
 	wmu      sync.Mutex
 	sent     uint32        // 本端已发出的字节数
 	acked    uint32        // 对端已消费的字节数(由 cmdWindow 更新)
 	wnd      chan struct{} // 窗口出现额度时唤醒等待者(容量 1)
 	consumed uint32        // 本端已写入下游的字节数
 	lastAck  uint32        // 上次通告出去的 consumed
+	// 从 muxer 复制过来,让 stream 自包含(测试可直接构造)
+	window   uint32
+	ackEvery uint32
 }
 
 func newMuxer(s *session, isServer bool, target string) *muxer {
+	w := streamWindowFor(s.rateBps, s.k, s.m)
 	m := &muxer{sess: s, isServer: isServer, target: target,
-		streams: make(map[uint32]*stream), nextID: 1}
+		streams: make(map[uint32]*stream), nextID: 1,
+		window: w, ackEvery: w / 2,
+		// 队列要装得下一整窗的帧,才保证对端守窗口时永不溢出;+16 留余量
+		queueDepth: int(w)/frameChunk + 16,
+	}
 	// 对端重启后序号空间已重置,旧 stream 全部失效,必须清掉
 	s.onReset = m.resetAll
 	go m.recvLoop()
@@ -109,9 +146,11 @@ func newMuxer(s *session, isServer bool, target string) *muxer {
 
 func newStream(m *muxer, sid uint32, c net.Conn) *stream {
 	st := &stream{id: sid, conn: c, mux: m,
-		wq:   make(chan wqItem, streamQueueDepth),
-		done: make(chan struct{}),
-		wnd:  make(chan struct{}, 1),
+		wq:       make(chan wqItem, m.queueDepth),
+		done:     make(chan struct{}),
+		wnd:      make(chan struct{}, 1),
+		window:   m.window,
+		ackEvery: m.ackEvery,
 	}
 	go st.writeLoop()
 	return st
@@ -272,7 +311,7 @@ func (s *stream) ackConsumed(n int) {
 	s.wmu.Lock()
 	s.consumed += uint32(n)
 	cur := s.consumed
-	need := cur-s.lastAck >= windowUpdateThreshold
+	need := cur-s.lastAck >= s.ackEvery
 	if need {
 		s.lastAck = cur
 	}
@@ -289,7 +328,7 @@ func (s *stream) ackConsumed(n int) {
 func (s *stream) reserve(n int) bool {
 	for {
 		s.wmu.Lock()
-		if s.sent-s.acked+uint32(n) <= streamWindow {
+		if s.sent-s.acked+uint32(n) <= s.window {
 			s.sent += uint32(n)
 			s.wmu.Unlock()
 			return true
@@ -324,8 +363,8 @@ func (s *stream) pumpToTunnel() {
 		n, err := s.conn.Read(buf)
 		if n > 0 {
 			// 单帧上限 65535,按 8K 切
-			for off := 0; off < n; off += 8192 {
-				end := off + 8192
+			for off := 0; off < n; off += frameChunk {
+				end := off + frameChunk
 				if end > n {
 					end = n
 				}

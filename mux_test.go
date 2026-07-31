@@ -295,7 +295,7 @@ func TestSlowStreamDoesNotStallOthers(t *testing.T) {
 }
 
 // 流控窗口必须能撑住远超一个窗口的传输。
-// 其他 mux 测试的数据量都小于 streamWindow(256 KB),窗口机制根本不会被触发 ——
+// 其他 mux 测试的数据量都小于窗口(rate=800 档约 4 MB 上限),窗口机制不会被触发 ——
 // 这个测试双向各推 4 MB,会跨越 30+ 次窗口更新。窗口更新一旦漏发或算错,
 // 发送方就会永久等在 reserve 里,表现为传输卡死。
 func TestFlowControlHandlesLargeTransfer(t *testing.T) {
@@ -325,7 +325,7 @@ func TestFlowControlHandlesLargeTransfer(t *testing.T) {
 		}
 	}()
 
-	const size = 4 << 20 // 远超 streamWindow,必然反复触发窗口更新
+	const size = 4 << 20 // 远超窗口,必然反复触发窗口更新
 	data := payload(size)
 	c, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {
@@ -358,16 +358,51 @@ func TestFlowControlHandlesLargeTransfer(t *testing.T) {
 	}
 }
 
+// 窗口必须跟着 -rate 走。单条 stream 的吞吐上限 = window / RTT,写死的窗口在
+// 高 rate 下会成为瓶颈:实测 rate=25、RTT=170ms 时 256 KB 固定窗口把吞吐压到
+// 12.0 Mbps(净上限 14.3);若 rate 调到 60(净 34 Mbps),256 KB 只够 12 Mbps。
+func TestStreamWindowScalesWithRate(t *testing.T) {
+	const k, m = 20, 15
+	bps := func(mbps float64) float64 { return mbps * 1e6 / 8 }
+
+	lo := streamWindowFor(bps(25), k, m)
+	hi := streamWindowFor(bps(200), k, m)
+	if hi <= lo {
+		t.Fatalf("窗口没跟着 rate 涨:rate=25 → %d,rate=200 → %d", lo, hi)
+	}
+
+	// 窗口应覆盖 windowSpan 秒的净在途数据(净速率 = 线路速率 / (1+m/k))
+	wantLo := uint32(bps(25) / (1 + float64(m)/float64(k)) * windowSpan)
+	if lo != wantLo {
+		t.Fatalf("rate=25 的窗口 %d,按净速率×%.1fs 应为 %d", lo, windowSpan, wantLo)
+	}
+
+	// 上下限必须封住:极低 rate 不能让窗口小到卡死,极高 rate 不能让它吃光内存
+	if got := streamWindowFor(bps(0.1), k, m); got != minStreamWin {
+		t.Fatalf("极低 rate 未落到下限:got %d want %d", got, minStreamWin)
+	}
+	if got := streamWindowFor(bps(10000), k, m); got != maxStreamWin {
+		t.Fatalf("极高 rate 未封到上限:got %d want %d", got, maxStreamWin)
+	}
+
+	// 冗余度要扣掉:同样线路速率下,冗余越高净速率越低,窗口越小
+	if lowRedundancy := streamWindowFor(bps(200), 20, 2); lowRedundancy <= hi {
+		t.Fatalf("冗余度没参与计算:m=15 → %d,m=2 → %d(后者净速率更高,窗口应更大)", hi, lowRedundancy)
+	}
+}
+
 // 流控记账用 uint32 累计字节数,传够 4 GB 就会绕回。
 // in-flight 是 sent-acked 的 uint32 减法,数学上能正确跨越绕回点 —— 这里直接
 // 把计数推到上限附近验证,不然这条路径要传 4 GB 才会走到。
 func TestFlowControlWrapsAroundUint32(t *testing.T) {
-	st := &stream{done: make(chan struct{}), wnd: make(chan struct{}, 1)}
+	const win = 256 << 10
+	st := &stream{done: make(chan struct{}), wnd: make(chan struct{}, 1),
+		window: win, ackEvery: win / 2}
 	const start = ^uint32(0) - 1000 // 起点距上限 1000 字节,后续申请必然绕回
 	st.sent, st.acked = start, start
 
 	const chunk = 8192
-	for i := 0; i < streamWindow/chunk; i++ { // 正好占满一个窗口
+	for i := 0; i < win/chunk; i++ { // 正好占满一个窗口
 		if !st.reserve(chunk) {
 			t.Fatalf("窗口未满,第 %d 次 reserve 却被拒", i)
 		}
