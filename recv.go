@@ -261,6 +261,8 @@ func (s *session) checkEpoch(e uint32) {
 	s.nextSeq = 0
 	s.curGroup = nil
 	s.sendBuf = make(map[uint32][]byte)
+	s.sendBufBytes = 0
+	s.sendBufTail = 0
 	s.sendMu.Unlock()
 
 	if s.onReset != nil {

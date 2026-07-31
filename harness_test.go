@@ -234,6 +234,41 @@ func TestGroupBookkeepingIsBounded(t *testing.T) {
 	}
 }
 
+// 回归:重传缓冲必须按字节封顶。
+// 曾经的 bug —— 上限写成"16384 个分片",而每片 1184 字节,等于 19.4 MB 常驻;
+// 裁剪后仍保 8192 片 ≈ 9.7 MB。GOGC=100 下这一项就把发送侧 RSS 推到 40 MB 量级。
+func TestSendBufferRespectsByteBudget(t *testing.T) {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	// peer 指向没人监听的端口:只关心发送侧缓冲的账,不需要对端。
+	// rate 用生产默认值 25 Mbps —— 预算是跟着 rate 算的,必须按真实档位验。
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, 20, 15, 25)
+	defer s.close()
+
+	const written = 8 << 20 // 远超 25 Mbps 档的预算,足以触发淘汰
+	s.write(payload(written))
+
+	s.sendMu.Lock()
+	var held int
+	for _, sh := range s.sendBuf {
+		held += len(sh)
+	}
+	shards := len(s.sendBuf)
+	s.sendMu.Unlock()
+
+	if shards == 0 {
+		t.Fatal("前置条件不成立:sendBuf 是空的,写入路径没跑到(测试无效)")
+	}
+	// ARQ 只需覆盖一个 RTT 内的在途数据,几 MB 足够。
+	const limit = 6 << 20
+	if held > limit {
+		t.Fatalf("重传缓冲占 %.1f MB(%d 片),超出 %.0f MB 预算 —— 上限是按包数而非字节封顶的",
+			float64(held)/(1<<20), shards, float64(limit)/(1<<20))
+	}
+}
+
 // 回归:FEC 应能在真实丢包下恢复字节流
 func TestFECRecoversUnderLoss(t *testing.T) {
 	px := newLossyProxy(t, 0.15, 1)
