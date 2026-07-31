@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -311,6 +312,52 @@ func TestSingleLowHeartbeatDoesNotReset(t *testing.T) {
 
 	if high != 300000 {
 		t.Fatalf("单个低心跳就触发了重置:recvHigh=%d —— 一次 UDP 乱序会白拆连接", high)
+	}
+}
+
+// 探针:deliver channel 满时,drain 是否持着 recvMu 阻塞?
+// 怀疑来自 2026-07-31 落地侧的现场 —— NACK 计数卡在 229600 不动、收包 2.5 分钟
+// 只涨 4 个、却仍在正常发心跳(心跳循环只用 sendMu)。若 drain 持 recvMu 阻塞在
+// deliver 写入,onPacket 与 nackLoop 会一起被拘死,症状正好吻合。
+// 失败时打印 goroutine 现场作为直接证据。
+func TestDrainDoesNotHoldRecvMuWhenDeliverFull(t *testing.T) {
+	const k, m = 20, 15
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, k, m, 1e6)
+	defer s.close()
+
+	// 故意不消费 deliver —— 模拟 mux.recvLoop 卡在下游 TCP 写(慢速对端)
+	go func() {
+		for g := uint32(0); g < 400; g++ { // 400*20 = 8000 个分片,远超 deliver 的 4096
+			for i := 0; i < k; i++ {
+				s.onPacket(dataShardPkt(g, i, k, m, 1))
+			}
+		}
+	}()
+
+	time.Sleep(500 * time.Millisecond)
+
+	if len(s.deliver) < cap(s.deliver) {
+		t.Fatalf("前置条件不成立:deliver 只有 %d/%d,没填满(测试无效)", len(s.deliver), cap(s.deliver))
+	}
+
+	// nackLoop 每 40ms 就要拿一次 recvMu。这里模拟它去抢锁。
+	locked := make(chan struct{})
+	go func() {
+		s.recvMu.Lock()
+		s.recvMu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(2 * time.Second):
+		buf := make([]byte, 1<<16)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("recvMu 被持有超过 2 秒 —— deliver 满时 drain 持锁阻塞在 channel 写,\n"+
+			"onPacket 与 nackLoop 会一起被拘死。goroutine 现场:\n%s", buf[:n])
 	}
 }
 
