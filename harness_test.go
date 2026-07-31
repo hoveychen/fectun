@@ -149,6 +149,31 @@ func TestHeaderRoundTrip(t *testing.T) {
 	}
 }
 
+// 回归:空载(双方都没发过任何数据分片)时不得发 NACK。
+// 曾经的 bug —— NACK 扫描区间写成 [expected, maxRecvSeq] 闭区间,而两者初值都是 0,
+// 于是 seq 0 被当作"已知缺口",每 120ms 请求重传一个还不存在的包,永不停止。
+func TestIdleSessionSendsNoNack(t *testing.T) {
+	px := newLossyProxy(t, 0, 21)
+	defer px.stop()
+	a := newTestSession(t, px.port(), 20, 15, 500)
+	b := newTestSession(t, px.port(), 20, 15, 500)
+	defer a.close()
+	defer b.close()
+
+	// 只跑心跳,不写任何业务数据。nackLoop 每 40ms 一跳、缺口 120ms 后才发,
+	// 1s 足够让 bug 版本发出多个 NACK。
+	time.Sleep(1 * time.Second)
+
+	for name, s := range map[string]*session{"a": a, "b": b} {
+		s.stats.Lock()
+		n := s.stats.nackSent
+		s.stats.Unlock()
+		if n != 0 {
+			t.Fatalf("session %s 在零流量下发了 %d 个 NACK(空载无效 NACK 回归)", name, n)
+		}
+	}
+}
+
 // 回归:FEC 应能在真实丢包下恢复字节流
 func TestFECRecoversUnderLoss(t *testing.T) {
 	px := newLossyProxy(t, 0.15, 1)
@@ -173,9 +198,9 @@ func TestFECRecoversUnderLoss(t *testing.T) {
 }
 
 // 回归:尾部连续丢包必须能被检测并重传。
-// 曾经的 bug —— NACK 只在 [expected, maxRecvSeq] 区间扫描,而尾部分片全丢时
-// maxRecvSeq 停在缺口之前,循环根本不执行,永久死锁。
-// 修复靠心跳携带发送端 nextSeq 把 maxRecvSeq 顶上去。
+// 曾经的 bug —— NACK 只在 [expected, recvHigh] 区间扫描,而尾部分片全丢时
+// recvHigh 停在缺口之前,循环根本不执行,永久死锁。
+// 修复靠心跳携带发送端 nextSeq 把 recvHigh 顶上去。
 func TestTailLossIsRecovered(t *testing.T) {
 	px := newLossyProxy(t, 0, 7)
 	defer px.stop()
@@ -279,7 +304,7 @@ func TestEpochChangeResetsState(t *testing.T) {
 	s.checkEpoch(1000) // 首次记录,不应重置
 	s.recvMu.Lock()
 	s.expected = 5000
-	s.maxRecvSeq = 5000
+	s.recvHigh = 5001
 	s.recvBuf[5000] = []byte("x")
 	s.recvMu.Unlock()
 	s.sendMu.Lock()
@@ -296,13 +321,13 @@ func TestEpochChangeResetsState(t *testing.T) {
 
 	s.checkEpoch(2000) // epoch 变化,必须重置
 	s.recvMu.Lock()
-	exp, mx, bufLen := s.expected, s.maxRecvSeq, len(s.recvBuf)
+	exp, mx, bufLen := s.expected, s.recvHigh, len(s.recvBuf)
 	s.recvMu.Unlock()
 	s.sendMu.Lock()
 	next := s.nextSeq
 	s.sendMu.Unlock()
 	if exp != 0 || mx != 0 || bufLen != 0 {
-		t.Fatalf("接收状态未重置: expected=%d maxRecvSeq=%d recvBuf=%d", exp, mx, bufLen)
+		t.Fatalf("接收状态未重置: expected=%d recvHigh=%d recvBuf=%d", exp, mx, bufLen)
 	}
 	if next != 0 {
 		t.Fatalf("发送状态未重置: nextSeq=%d", next)

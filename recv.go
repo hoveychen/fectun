@@ -13,15 +13,14 @@ func (s *session) onPacket(b []byte) {
 	s.checkEpoch(h.epoch)
 	switch h.typ {
 	case pktHeartbeat:
-		// 对端已发出 h.seq 个分片 → 最大 seq 应为 h.seq-1。
-		// 没有这一步,尾部丢包时 maxRecvSeq 永远追不上,NACK 不会触发(死锁)。
-		if h.seq > 0 {
-			s.recvMu.Lock()
-			if h.seq-1 > s.maxRecvSeq {
-				s.maxRecvSeq = h.seq - 1
-			}
-			s.recvMu.Unlock()
+		// h.seq = 对端已发出的分片总数,正好就是开区间上界。
+		// 没有这一步,尾部丢包时 recvHigh 永远追不上,NACK 不会触发(死锁)。
+		// h.seq==0 表示对端一个分片都没发过,此时不该有任何缺口。
+		s.recvMu.Lock()
+		if h.seq > s.recvHigh {
+			s.recvHigh = h.seq
 		}
+		s.recvMu.Unlock()
 		return
 	case pktNack:
 		s.onNack(h.seq)
@@ -57,8 +56,8 @@ func (s *session) onPacket(b []byte) {
 	// 数据片直接入重组缓冲
 	if int(h.shardIdx) < k {
 		seq := h.group*uint32(k) + uint32(h.shardIdx)
-		if seq > s.maxRecvSeq {
-			s.maxRecvSeq = seq
+		if seq+1 > s.recvHigh {
+			s.recvHigh = seq + 1
 		}
 		if seq >= s.expected && s.recvBuf[seq] == nil {
 			s.recvBuf[seq] = payload
@@ -100,8 +99,8 @@ func (s *session) tryRecover(group uint32) {
 	recovered := 0
 	for i := 0; i < s.k; i++ {
 		seq := group*uint32(s.k) + uint32(i)
-		if seq > s.maxRecvSeq {
-			s.maxRecvSeq = seq
+		if seq+1 > s.recvHigh {
+			s.recvHigh = seq + 1
 		}
 		if seq >= s.expected && s.recvBuf[seq] == nil && g[i] != nil {
 			s.recvBuf[seq] = g[i]
@@ -156,10 +155,11 @@ func (s *session) nackLoop() {
 		case <-t.C:
 		}
 		s.recvMu.Lock()
-		maxSeq := s.maxRecvSeq
+		high := s.recvHigh
 		var want []uint32
 		now := time.Now()
-		for q := s.expected; q <= maxSeq && len(want) < 32; q++ {
+		// 开区间:q < high。recvHigh==0 时循环不执行,空载不会误发 NACK。
+		for q := s.expected; q < high && len(want) < 32; q++ {
 			if s.recvBuf[q] != nil {
 				continue
 			}
@@ -220,7 +220,7 @@ func (s *session) checkEpoch(e uint32) {
 	// 对端换了 epoch = 对端重启过
 	s.peerEpoch = e
 	s.expected = 0
-	s.maxRecvSeq = 0
+	s.recvHigh = 0
 	s.recvBuf = make(map[uint32][]byte)
 	s.groups = make(map[uint32][][]byte)
 	s.groupDone = make(map[uint32]bool)

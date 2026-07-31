@@ -32,10 +32,13 @@ type session struct {
 	rateBps  float64
 
 	// ---- 接收侧 ----
-	recvMu    sync.Mutex
-	expected   uint32
-	maxRecvSeq uint32                       // 已见过的最大 seq,避免遍历 map 求最大值
-	recvBuf    map[uint32][]byte            // seq -> 已到达的数据分片
+	recvMu   sync.Mutex
+	expected uint32
+	// recvHigh 是"已知对端发出过的 seq"的开区间上界(= 最大已见 seq + 1)。
+	// 用开区间而非"最大已见 seq":后者初值 0 与"真的见过 seq 0"无法区分,
+	// 会让 NACK 循环把还不存在的 seq 0 当成缺口,空载时无限重传请求。
+	recvHigh  uint32
+	recvBuf   map[uint32][]byte            // seq -> 已到达的数据分片
 	groups    map[uint32][][]byte          // group -> 分片槽位(含校验片)
 	groupDone map[uint32]bool
 	firstSeen map[uint32]time.Time         // seq 缺口首次发现时间,用于 NACK 定时
