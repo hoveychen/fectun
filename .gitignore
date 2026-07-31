@@ -3,3 +3,7 @@ fectun
 fectun-linux
 fectun-linux-amd64
 *.exe
+
+# 开发期临时物
+.worktrees/
+TASKS.md
