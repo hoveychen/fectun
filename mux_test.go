@@ -105,6 +105,101 @@ func TestHalfCloseKeepsReadDirection(t *testing.T) {
 	}
 }
 
+// startBlackhole 起一个收下连接但既不读也不关的服务。
+// 模拟落地侧 sshd 在 LoginGraceTime 内等待客户端 —— 它不会回 EOF,
+// 所以对端不会发 cmdShutdown 过来。
+func startBlackhole(t *testing.T) (addr string, stop func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("blackhole listen: %v", err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c) // 收下,既不读也不关
+			mu.Unlock()
+		}
+	}()
+	return ln.Addr().String(), func() {
+		ln.Close()
+		mu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		mu.Unlock()
+	}
+}
+
+// 回归:本端已读完但对端迟迟不回 cmdShutdown 的 stream 必须被回收。
+// 2026-07-31 实测:入口侧 4422 暴露在公网被 5.231.242.176 以 ~2 次/秒 高频连接,
+// 每条"连上就断"的连接都留下一条 stream —— 40 分钟内新建 4306 条、关闭仅 1680 条,
+// 积压 2626 条,每条带 2 个 goroutine(约 16 KB 栈),把 RSS 顶到 46 MB 且不回落。
+func TestHalfClosedStreamIsReclaimed(t *testing.T) {
+	old := halfCloseLinger
+	halfCloseLinger = 600 * time.Millisecond
+	defer func() { halfCloseLinger = old }()
+
+	bhAddr, stopBH := startBlackhole(t)
+	defer stopBH()
+
+	px := newLossyProxy(t, 0, 61)
+	defer px.stop()
+	cliSess := newTestSession(t, px.port(), 20, 15, 500)
+	srvSess := newTestSession(t, px.port(), 20, 15, 500)
+	defer cliSess.close()
+	defer srvSess.close()
+	time.Sleep(300 * time.Millisecond)
+
+	cliMux := newMuxer(cliSess, false, "")
+	newMuxer(srvSess, true, bhAddr)
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			cliMux.openStream(c)
+		}
+	}()
+
+	// 模拟扫描器:连上立刻断开
+	for i := 0; i < 5; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial %d: %v", i, err)
+		}
+		c.Close()
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	cliMux.mu.Lock()
+	before := len(cliMux.streams)
+	cliMux.mu.Unlock()
+	if before == 0 {
+		t.Fatal("前置条件不成立:stream 没建起来,测试无效")
+	}
+
+	// 等过 linger 时限
+	time.Sleep(2 * time.Second)
+	cliMux.mu.Lock()
+	after := len(cliMux.streams)
+	cliMux.mu.Unlock()
+	if after != 0 {
+		t.Fatalf("半关闭的 stream 未被回收:%d 条仍在册(峰值 %d)—— 连上就断的连接会无限积压",
+			after, before)
+	}
+}
+
 // startSpew 起一个"猛发"服务:accept 后往回灌 n 字节。
 // 用来把某条 stream 的下游 TCP 缓冲填满,制造写阻塞。
 func startSpew(t *testing.T, n int) (addr string, stop func()) {

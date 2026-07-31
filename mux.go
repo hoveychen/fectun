@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 )
 
 // 在可靠字节流之上做帧,实现多连接复用。
@@ -29,6 +30,17 @@ const streamWindow = 256 << 10
 // pumpToTunnel 按 8 KB 切帧,streamWindow/8KB = 32 帧,取 48 留余量。
 // 对端守窗口时这个队列不会满。
 const streamQueueDepth = 48
+
+// halfCloseLinger:本端已读完(sentEOF)、但对端迟迟不回 cmdShutdown 时,最多再等多久。
+//
+// 半关闭是合法语义(发完请求等响应),所以不能太短;但没有上限就会积压 ——
+// 2026-07-31 实测:入口侧 4422 暴露在公网被以 ~2 次/秒 高频连接,每条"连上就断"
+// 的连接都留下一条 stream 及其 goroutine,40 分钟积压 2626 条、约 42 MB 且不回落。
+// 落地侧的 sshd 在 LoginGraceTime 内只是静静等待,不会回 EOF,所以对端的
+// cmdShutdown 永远不来。
+//
+// 是变量而非常量:测试要把它调短。
+var halfCloseLinger = 60 * time.Second
 
 // windowUpdateThreshold:累计消费超过这么多字节就回一个窗口更新帧。
 // 取窗口的一半:既不会每帧都回(白占隧道带宽),又能让发送方始终有额度。
@@ -333,6 +345,10 @@ func (s *stream) pumpToTunnel() {
 			s.mu.Unlock()
 			if !already {
 				s.mux.sendFrame(s.id, cmdShutdown, nil)
+				// 对端可能永远不回 cmdShutdown(落地侧 sshd 在 LoginGraceTime 内
+				// 只是静静等待,不会回 EOF)。没有上限的话这条 stream 及其两个
+				// goroutine 就一直挂着 —— 公网端口被高频连接时会无限积压。
+				s.lingerAfterEOF()
 			}
 			if both {
 				// 走队列:对端的数据可能还排在写队列里没落地,
@@ -342,6 +358,21 @@ func (s *stream) pumpToTunnel() {
 			return
 		}
 	}
+}
+
+// lingerAfterEOF 给"已发出 cmdShutdown、等对端回应"的状态设一个上限。
+// 超时仍未收到对端的 cmdShutdown 就主动拆掉,并用 cmdClose 通知对端一起回收 ——
+// 否则对端那一侧也会挂着同样一条 stream。
+// 用 time.AfterFunc 而不是起 goroutine:定时器由 runtime 管,不额外占栈。
+func (s *stream) lingerAfterEOF() {
+	time.AfterFunc(halfCloseLinger, func() {
+		s.mu.Lock()
+		stuck := !s.recvEOF && !s.closed
+		s.mu.Unlock()
+		if stuck {
+			s.close(true)
+		}
+	})
 }
 
 func (s *stream) close(notify bool) {
