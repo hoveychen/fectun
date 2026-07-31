@@ -10,6 +10,11 @@ import (
 
 const shardPayload = maxShard - hdrSize // 每分片可承载的字节数
 
+// groupKeepWindow:即使一个组的全部 seq 都已交付,仍保留这么多组的记账,
+// 用来吸收迟到的重传与重复包(它们只会落在最近几个组里)。
+// 超出窗口的组记录必须删除 —— 否则 groupDone 每组一条、永不释放。
+const groupKeepWindow = 128
+
 type session struct {
 	conn *net.UDPConn
 	peer *net.UDPAddr
@@ -37,8 +42,11 @@ type session struct {
 	// recvHigh 是"已知对端发出过的 seq"的开区间上界(= 最大已见 seq + 1)。
 	// 用开区间而非"最大已见 seq":后者初值 0 与"真的见过 seq 0"无法区分,
 	// 会让 NACK 循环把还不存在的 seq 0 当成缺口,空载时无限重传请求。
-	recvHigh  uint32
-	recvBuf   map[uint32][]byte            // seq -> 已到达的数据分片
+	recvHigh uint32
+	// prunedGroup 是记账淘汰游标:组号 < 该值的组已全部交付完毕,
+	// 其 groups/groupDone 记录已被删除,后续再收到这些组的重复包一律忽略。
+	prunedGroup uint32
+	recvBuf     map[uint32][]byte            // seq -> 已到达的数据分片
 	groups    map[uint32][][]byte          // group -> 分片槽位(含校验片)
 	groupDone map[uint32]bool
 	firstSeen map[uint32]time.Time         // seq 缺口首次发现时间,用于 NACK 定时

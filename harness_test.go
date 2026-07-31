@@ -174,6 +174,66 @@ func TestIdleSessionSendsNoNack(t *testing.T) {
 	}
 }
 
+// dataShardPkt 拼一个合法的数据分片包,payload 前两字节是有效长度。
+func dataShardPkt(group uint32, idx, k, m int, epoch uint32) []byte {
+	pkt := make([]byte, hdrSize+shardPayload)
+	header{typ: pktData, shardIdx: byte(idx), k: byte(k), m: byte(m),
+		group: group, seq: group*uint32(k) + uint32(idx), epoch: epoch}.marshal(pkt)
+	body := pkt[hdrSize:]
+	body[0], body[1] = 0, 8 // 每片承载 8 字节有效数据
+	for i := 0; i < 8; i++ {
+		body[2+i] = byte(i)
+	}
+	return pkt
+}
+
+// 回归:FEC 组的记账 map 必须有界。
+// 曾经的 bug —— groupDone 每个组留一条记录且永不删除,groups 里卡住的组也不淘汰。
+// 一条组承载 k*(shardPayload-2) 字节,长期运行累计几百 GB 就是上百 MB 的常驻内存。
+func TestGroupBookkeepingIsBounded(t *testing.T) {
+	const k, m = 20, 15
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, k, m, 1e6)
+	defer s.close()
+
+	// 消费 deliver,否则 drain 会在 channel 满时阻塞
+	go func() {
+		for {
+			select {
+			case <-s.deliver:
+			case <-s.closed:
+				return
+			}
+		}
+	}()
+
+	// 3000 个组全部完整到达 —— 每个组都会走"完成"路径
+	const nGroups = 3000
+	for g := uint32(0); g < nGroups; g++ {
+		for i := 0; i < k; i++ {
+			s.onPacket(dataShardPkt(g, i, k, m, 1))
+		}
+	}
+
+	s.recvMu.Lock()
+	done, groups, expected := len(s.groupDone), len(s.groups), s.expected
+	s.recvMu.Unlock()
+
+	if expected != nGroups*k {
+		t.Fatalf("前置条件不成立:expected=%d,应为 %d(数据没被正常交付,测试无效)", expected, nGroups*k)
+	}
+	// 交付完成的组不需要再记账,留一个小窗口容纳迟到重传即可
+	if done > 512 {
+		t.Fatalf("groupDone 无界增长:%d 个组已全部交付完毕却仍在记账中(上限应为常数)", done)
+	}
+	if groups > 512 {
+		t.Fatalf("groups 无界增长:残留 %d 条组槽位", groups)
+	}
+}
+
 // 回归:FEC 应能在真实丢包下恢复字节流
 func TestFECRecoversUnderLoss(t *testing.T) {
 	px := newLossyProxy(t, 0.15, 1)

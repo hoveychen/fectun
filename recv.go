@@ -42,6 +42,12 @@ func (s *session) onPacket(b []byte) {
 		s.recvMu.Unlock()
 		return
 	}
+	// 已淘汰记账的组:整组早已交付,这是迟到的重传或重复包。必须在这里丢掉 ——
+	// 否则它会重新往 groups 里塞一条,而淘汰游标已经走过、永远不会回头删它。
+	if h.group < s.prunedGroup {
+		s.recvMu.Unlock()
+		return
+	}
 	// 归入 FEC 组
 	if !s.groupDone[h.group] {
 		g := s.groups[h.group]
@@ -65,7 +71,29 @@ func (s *session) onPacket(b []byte) {
 	}
 	s.tryRecover(h.group)
 	s.drain()
+	s.pruneGroups()
 	s.recvMu.Unlock()
+}
+
+// pruneGroups 淘汰"整组 seq 都已低于 expected"的组记账。
+// 这些组的数据早已交付,groups/groupDone 里的条目再无用途;不删就是每组一条、
+// 随累计流量线性增长的常驻内存。
+// 用游标推进而不是遍历整个 map:开销与本次新过期的组数成正比,不是 map 大小。
+// 调用者必须持有 recvMu。
+func (s *session) pruneGroups() {
+	// expected 是下一个待交付的 seq,故 expected/k 之前的组已整组交付完毕
+	safe := s.expected / uint32(s.k)
+	if safe <= groupKeepWindow {
+		return
+	}
+	cutoff := safe - groupKeepWindow
+	for g := s.prunedGroup; g < cutoff; g++ {
+		delete(s.groups, g)
+		delete(s.groupDone, g)
+	}
+	if cutoff > s.prunedGroup {
+		s.prunedGroup = cutoff
+	}
 }
 
 // FEC 恢复:组内收到 >= k 片即可重构全部数据片
@@ -221,6 +249,7 @@ func (s *session) checkEpoch(e uint32) {
 	s.peerEpoch = e
 	s.expected = 0
 	s.recvHigh = 0
+	s.prunedGroup = 0
 	s.recvBuf = make(map[uint32][]byte)
 	s.groups = make(map[uint32][][]byte)
 	s.groupDone = make(map[uint32]bool)
