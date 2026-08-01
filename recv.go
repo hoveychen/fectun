@@ -196,6 +196,13 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 	if !ok {
 		return nil
 	}
+	// 补位零片(flushStaleGroup 造的):dataLen=0、不属于任何 stream,
+	// 只是占住 seq 让序号连续。这里必须提前返回 —— 否则每个补位片都会在
+	// streamRecv 里留下一条 sid=0 的垃圾条目。mux 的 nextID 从 1 起,
+	// sid=0 不会与真实 stream 撞号。
+	if sid == 0 && len(data) == 0 {
+		return nil
+	}
 	r := s.streamRecv[sid]
 	if r == nil {
 		r = &streamReasm{buf: make(map[uint32][]byte)}

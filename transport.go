@@ -37,6 +37,24 @@ const nackWindow = 4096
 // 的旧心跳只会偶发报低值),而真正的重置会一直报低值。
 const lowHbResetStreak = 3
 
+// groupFlushAfter:一组攒不满时,最多等这么久就补零片凑满、把校验片发出去。
+//
+// 必须显著小于 NACK 的 120ms 缺口判定 —— 否则校验片到得比重传请求还晚,
+// FEC 白攒。2026-08-01 生产实测:927 包/s 时攒满一组只要 22ms,FEC 轻松赶在
+// 前面(NACK 率 0.17%);流量掉到 110 包/s 后攒一组要 182ms,远超 120ms 判定,
+// NACK 率升到 1.9%,那些重传全是白跑的。
+const groupFlushAfter = 40 * time.Millisecond
+
+// groupFlushMinShards 的分母:组内至少攒到 k/该值 片才值得补零 flush。
+//
+// 补零是有代价的 —— 攒了 j 片就要补 (k-j) 个空片再加 m 个校验片,发包量
+// 放大 (k+m)/j 倍。极端情况(每秒才一个包)下 j=1,放大 40 倍,纯属自残。
+// 取 k/4 是个折中:110 包/s 下攒 5 片约 45ms,放大 7 倍,而低流量时带宽本就
+// 富余;真到了每秒几个包的量级就不再 flush,退回 ARQ 兜底。
+//
+// 标注:这个分母是权衡取的,不是实测最优值。要调优得先有低流量档的压测数据。
+const groupFlushMinDiv = 4
+
 // sendBufBudgetFor 算出重传缓冲的字节预算:取 1 秒的在途数据量,足以覆盖
 // NACK 的 120ms 缺口判定加一个重传往返。
 //
@@ -86,7 +104,8 @@ type session struct {
 	// ---- 发送侧 ----
 	sendMu   sync.Mutex
 	nextSeq  uint32
-	curGroup []([]byte) // 当前 FEC 组累积的数据分片
+	curGroup   []([]byte) // 当前 FEC 组累积的数据分片
+	curGroupAt time.Time  // 本组第一片的入组时刻,用于超时 flush
 	sendBuf  map[uint32][]byte
 	// 重传缓冲的字节账 + 淘汰游标(最老的仍可能在册的 seq)。
 	// 记着字节数才能按 sendBufBudget 封顶;记着游标才能 O(1) 淘汰最老的,
@@ -161,6 +180,7 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 	s.tokens = s.rateBps * 0.05
 	go s.heartbeatLoop()
 	go s.nackLoop()
+	go s.groupFlushLoop()
 	return s
 }
 
@@ -231,6 +251,45 @@ func (s *session) writeStream(sid uint32, p []byte) {
 	}
 }
 
+// groupFlushLoop 定期把攒了一半、迟迟满不了的 FEC 组补零发出。
+func (s *session) groupFlushLoop() {
+	t := time.NewTicker(groupFlushAfter / 2)
+	defer t.Stop()
+	for {
+		select {
+		case <-s.closed:
+			return
+		case <-t.C:
+			s.flushStaleGroup()
+		}
+	}
+}
+
+// flushStaleGroup 把超时未满的组补零片凑满 k,好让校验片发得出去。
+//
+// 必须补零片,不能跳 seq:发送侧跳过的 seq 在接收侧是永远补不上的空洞 ——
+// sendBuf 里根本没有那一片,对端 NACK 过来 onNack 也重传不出来,
+// expected 就此卡死。补零片让 seq 保持连续,接收侧一行都不用改;
+// 零片的载荷 dataLen=0,acceptShardLocked 那边自然不会交付任何字节。
+func (s *session) flushStaleGroup() {
+	min := s.k / groupFlushMinDiv
+	if min < 2 {
+		min = 2
+	}
+	for {
+		s.sendMu.Lock()
+		n := len(s.curGroup)
+		stale := n >= min && n < s.k && time.Since(s.curGroupAt) >= groupFlushAfter
+		s.sendMu.Unlock()
+		if !stale {
+			return
+		}
+		pad := make([]byte, shardPayload)
+		marshalShard(pad, 0, 0, nil)
+		s.pushShard(pad) // 攒满那一刻 pushShard 自己会把校验片发出去
+	}
+}
+
 // forgetStream 清掉某条 stream 的收发记账。
 // 不清就是每条 stream 一条、随累计连接数线性增长的常驻内存 —— 入口侧 4422
 // 暴露在公网被 ~2 次/秒 高频连接,2026-07-31 实测 40 分钟积压 2626 条 stream。
@@ -248,6 +307,9 @@ func (s *session) pushShard(shard []byte) {
 	s.sendMu.Lock()
 	seq := s.nextSeq
 	s.nextSeq++
+	if len(s.curGroup) == 0 {
+		s.curGroupAt = time.Now()
+	}
 	s.curGroup = append(s.curGroup, shard)
 	s.sendBuf[seq] = shard
 	s.sendBufBytes += len(shard)
