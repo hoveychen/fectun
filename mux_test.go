@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -534,9 +535,11 @@ func TestResetClearsFrameBuffer(t *testing.T) {
 	defer srvSess.close()
 	srvMux := newMuxer(srvSess, true, echoAddr)
 
-	// 1. 对端重启前:一个被截断的帧卡在 recvLoop 的 buf 里。
+	// 1. 对端重启前:一个被截断的帧卡在 recvLoop 里该 stream 的 buf 中。
 	//    帧头要 7 字节,这里只送 3 字节,recvLoop 会 break 出内层循环等后续字节。
-	srvSess.deliver <- []byte{0xAA, 0xBB, 0xCC}
+	//    残帧必须和后续的新帧同属一个 sid,否则它们落进不同的 buf,污染不到。
+	const wantSID = 42
+	srvSess.deliver <- streamChunk{sid: wantSID, data: []byte{0xAA, 0xBB, 0xCC}}
 	time.Sleep(100 * time.Millisecond)
 
 	// 2. 对端重启 → session 层重置序号空间 → onReset → resetAll
@@ -544,12 +547,11 @@ func TestResetClearsFrameBuffer(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// 3. 重启后对端从干净的字节流重新开始:一个完整的 cmdOpen(sid=42)
-	const wantSID = 42
 	frame := make([]byte, frameHdr)
 	binary.BigEndian.PutUint32(frame[0:4], wantSID)
 	frame[4] = cmdOpen
 	binary.BigEndian.PutUint16(frame[5:7], 0)
-	srvSess.deliver <- frame
+	srvSess.deliver <- streamChunk{sid: wantSID, data: frame}
 
 	// 4. server 侧应据此连上 target 并登记 stream 42
 	deadline := time.Now().Add(3 * time.Second)
@@ -560,4 +562,115 @@ func TestResetClearsFrameBuffer(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("对端重启后 cmdOpen(sid=%d) 未被正确解析 —— 残留的半帧把帧边界撕错了", wantSID)
+}
+
+// nextSeqOf 读发送侧当前序号(测试用,需持锁)。
+func nextSeqOf(s *session) uint32 {
+	s.sendMu.Lock()
+	defer s.sendMu.Unlock()
+	return s.nextSeq
+}
+
+// 回归:一条 stream 的分片丢失,不得拖停其他 stream。
+//
+// 这是"重组侧队头阻塞",与 TestSlowStreamDoesNotStallOthers 覆盖的"消费侧队头
+// 阻塞"是两回事:那个是下游 TCP 写阻塞卡住 recvLoop,已由 per-stream 写队列解决;
+// 这个发生在更下面一层 —— session.drainLocked 严格按全局 expected 递增交付,
+// 任何一个分片 FEC 救不回,deliver 就一字不吐,整条隧道所有 stream 一起停摆,
+// 直到 ARQ 把那个空洞补上。流控窗口和写队列都在 dispatch 之后,救不了上游。
+//
+// 2026-08-01 生产实测:入口侧 NACK 3.3/s,每次空洞停摆 120ms(NACK 判定)+69ms
+// (重传往返),量级上每秒有大半秒隧道是停的。
+func TestLostShardDoesNotStallOtherStreams(t *testing.T) {
+	echoAddr, stopEcho := startEcho(t)
+	defer stopEcho()
+
+	px := newLossyProxy(t, 0, 91)
+	defer px.stop()
+	cliSess := newTestSession(t, px.port(), 20, 15, 800)
+	srvSess := newTestSession(t, px.port(), 20, 15, 800)
+	defer cliSess.close()
+	defer srvSess.close()
+	time.Sleep(300 * time.Millisecond)
+
+	cliMux := newMuxer(cliSess, false, "")
+	newMuxer(srvSess, true, echoAddr)
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			cliMux.openStream(c)
+		}
+	}()
+
+	// stream A:只写不读。echo 服务要读到 EOF 才回送,A 不半关闭,
+	// 于是 A 的流量全部是 cli→srv 单向的 —— 丢包窗口才不会误伤 srv→cli 方向。
+	a, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("stream A dial: %v", err)
+	}
+	defer a.Close()
+
+	// 先推高 cli 侧 seq,让后面设的丢包窗口落在 srv 侧 seq 触及不到的高位
+	if _, err := a.Write(payload(640 << 10)); err != nil {
+		t.Fatalf("stream A 预热写入失败: %v", err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for nextSeqOf(cliSess) < 400 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// 开一个丢包窗口:A 接下来发的分片连丢 5 轮,ARQ 要 5 个 120ms 判定周期
+	// 才补得上,空洞至少存在 600ms。
+	from := nextSeqOf(cliSess)
+	px.mu.Lock()
+	px.dropFrom, px.dropTo = from, from+150
+	px.dropTimes = 5
+	px.dropEnabled = true
+	px.mu.Unlock()
+
+	if _, err := a.Write(payload(320 << 10)); err != nil {
+		t.Fatalf("stream A 二次写入失败: %v", err)
+	}
+	// 等 A 这批数据全部发出(seq 越过丢包窗口),B 的分片才不会落进窗口里
+	deadline = time.Now().Add(5 * time.Second)
+	for nextSeqOf(cliSess) <= from+150 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := nextSeqOf(cliSess); got <= from+150 {
+		t.Fatalf("stream A 的数据没能发满丢包窗口(seq=%d, 需 >%d)", got, from+150)
+	}
+
+	// stream B:全新连接,它的分片一个都没丢,必须能独立完成往返。
+	b, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("stream B dial: %v", err)
+	}
+	defer b.Close()
+	if _, err := b.Write([]byte("ping")); err != nil {
+		t.Fatalf("stream B 写入失败: %v", err)
+	}
+	b.(*net.TCPConn).CloseWrite() // 触发 echo 回送
+
+	start := time.Now()
+	b.SetReadDeadline(time.Now().Add(400 * time.Millisecond))
+	buf := make([]byte, 64)
+	n, err := b.Read(buf)
+	if err != nil || string(buf[:n]) != "ping" {
+		srvSess.recvMu.Lock()
+		detail := fmt.Sprintf("srv expected=%d recvHigh=%d seen=%d",
+			srvSess.expected, srvSess.recvHigh, len(srvSess.recvSeen))
+		for sid, r := range srvSess.streamRecv {
+			detail += fmt.Sprintf(" | sid=%d exp=%d buffered=%d", sid, r.expected, len(r.buf))
+		}
+		srvSess.recvMu.Unlock()
+		t.Fatalf("stream B 在 %v 内没拿到回显(收到 %q, err=%v)"+
+			" —— stream A 的分片空洞把整条隧道的交付卡住了\n%s",
+			time.Since(start), buf[:n], err, detail)
+	}
 }

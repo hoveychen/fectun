@@ -54,6 +54,22 @@ func sendBufBudgetFor(rateBps float64) int {
 	return b
 }
 
+// streamChunk 是交付给上层的一段数据,带上它属于哪条 stream。
+// 从前 deliver 是裸的 chan []byte —— 一条全局字节流,顺序由全局 seq 决定,
+// 那正是队头阻塞的根。现在归属随数据一起交付,上层按 stream 各自切帧。
+type streamChunk struct {
+	sid  uint32
+	data []byte
+}
+
+// streamReasm 是单条 stream 的重组状态。
+// 每条 stream 独立按 streamSeq 严格有序交付:TCP 字节流仍要求完整有序,
+// 但"有序"的范围缩到了单条 stream 内,不再是整条隧道。
+type streamReasm struct {
+	expected uint32            // 下一个待交付的 streamSeq
+	buf      map[uint32][]byte // 乱序先到的分片
+}
+
 type session struct {
 	conn *net.UDPConn
 	peer *net.UDPAddr
@@ -77,6 +93,9 @@ type session struct {
 	sendBufBytes  int
 	sendBufTail   uint32
 	sendBufBudget int
+	// 每条 stream 独立的发送序号。接收侧按 (streamID, streamSeq) 重组,
+	// 所以这个序号必须逐 stream 连续,不能跟全局 seq 混用。
+	sendSeqOf map[uint32]uint32
 	tokens        float64 // 令牌桶
 	lastFill      time.Time
 	rateBps       float64
@@ -93,11 +112,22 @@ type session struct {
 	// prunedGroup 是记账淘汰游标:组号 < 该值的组已全部交付完毕,
 	// 其 groups/groupDone 记录已被删除,后续再收到这些组的重复包一律忽略。
 	prunedGroup uint32
-	recvBuf     map[uint32][]byte   // seq -> 已到达的数据分片
-	groups      map[uint32][][]byte // group -> 分片槽位(含校验片)
-	groupDone   map[uint32]bool
-	firstSeen   map[uint32]time.Time // seq 缺口首次发现时间,用于 NACK 定时
-	deliver     chan []byte
+	// recvSeen 只记"这个全局 seq 收到过",不再囤载荷。
+	//
+	// 从前这里是 map[uint32][]byte,分片要一直留到全局 expected 连续推进到它
+	// 才交付 —— expected 处一出深空洞,其后所有分片就无上限堆积(2026-08-01
+	// 入口侧实测 RSS 74.9 MB)。现在分片一到就按归属分发进 streamRecv,
+	// 这里只留一个标记:全局 seq 的唯一用途是 NACK 缺口检测。
+	recvSeen  map[uint32]bool
+	groups    map[uint32][][]byte // group -> 分片槽位(含校验片)
+	groupDone map[uint32]bool
+	firstSeen map[uint32]time.Time // seq 缺口首次发现时间,用于 NACK 定时
+
+	// streamRecv 是逐 stream 的重组缓冲。一条 stream 的空洞只挡它自己,
+	// 别的 stream 照常交付 —— 这就是解开重组侧队头阻塞的地方。
+	// 堆积量受该 stream 的流控窗口(最大 4 MB)约束,天然有界。
+	streamRecv map[uint32]*streamReasm
+	deliver    chan streamChunk
 
 	stats struct {
 		sync.Mutex
@@ -110,12 +140,14 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 	enc, _ := reedsolomon.New(k, m)
 	s := &session{
 		conn: conn, peer: peer, k: k, m: m, enc: enc,
-		sendBuf:   make(map[uint32][]byte),
-		recvBuf:   make(map[uint32][]byte),
-		groups:    make(map[uint32][][]byte),
-		groupDone: make(map[uint32]bool),
-		firstSeen: make(map[uint32]time.Time),
-		deliver:   make(chan []byte, 4096),
+		sendBuf:    make(map[uint32][]byte),
+		sendSeqOf:  make(map[uint32]uint32),
+		recvSeen:   make(map[uint32]bool),
+		groups:     make(map[uint32][][]byte),
+		groupDone:  make(map[uint32]bool),
+		firstSeen:  make(map[uint32]time.Time),
+		streamRecv: make(map[uint32]*streamReasm),
+		deliver:    make(chan streamChunk, 4096),
 		closed:    make(chan struct{}),
 		rateBps:   rateMbps * 1e6 / 8,
 		lastFill:  time.Now(),
@@ -174,20 +206,41 @@ func (s *session) heartbeatLoop() {
 	}
 }
 
-// 写入一段字节流:切片 → 攒够 k 片做 FEC → 发送 k+m 包
-func (s *session) write(p []byte) {
+// writeStream 写入一段属于 sid 的字节流:切片 → 攒够 k 片做 FEC → 发送 k+m 包。
+//
+// 分片不跨 stream:每一片只承载一条 stream 的数据,并在载荷里带上
+// (streamID, streamSeq)。接收侧据此独立重组,一条 stream 的空洞不再挡住别人。
+// 代价是小帧(窗口更新、open/close)会独占一片、填不满 —— 实测这类控制帧
+// 占比不到 1%,换掉队头阻塞值得。
+func (s *session) writeStream(sid uint32, p []byte) {
 	for len(p) > 0 {
 		n := len(p)
-		if n > shardPayload-2 {
-			n = shardPayload - 2
+		if n > shardPayload-shardHdr {
+			n = shardPayload - shardHdr
 		}
+		s.sendMu.Lock()
+		sseq := s.sendSeqOf[sid]
+		s.sendSeqOf[sid] = sseq + 1
+		s.sendMu.Unlock()
+
 		shard := make([]byte, shardPayload)
-		shard[0] = byte(n >> 8)
-		shard[1] = byte(n)
-		copy(shard[2:], p[:n])
+		marshalShard(shard, sid, sseq, p[:n])
 		p = p[n:]
 		s.pushShard(shard)
 	}
+}
+
+// forgetStream 清掉某条 stream 的收发记账。
+// 不清就是每条 stream 一条、随累计连接数线性增长的常驻内存 —— 入口侧 4422
+// 暴露在公网被 ~2 次/秒 高频连接,2026-07-31 实测 40 分钟积压 2626 条 stream。
+func (s *session) forgetStream(sid uint32) {
+	s.sendMu.Lock()
+	delete(s.sendSeqOf, sid)
+	s.sendMu.Unlock()
+
+	s.recvMu.Lock()
+	delete(s.streamRecv, sid)
+	s.recvMu.Unlock()
 }
 
 func (s *session) pushShard(shard []byte) {

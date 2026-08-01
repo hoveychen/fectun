@@ -56,3 +56,39 @@ func parseHeader(b []byte) (h header, ok bool) {
 	h.epoch = binary.BigEndian.Uint32(b[12:16])
 	return h, true
 }
+
+// 分片载荷布局(10 字节头 + 数据):
+//
+//	[0:4]   streamID   本片承载哪条 stream 的数据
+//	[4:8]   streamSeq  该 stream 内的分片序号,接收侧据此独立重组
+//	[8:10]  dataLen    本片实际承载的字节数(不足一片时补零填充)
+//	[10:]   data
+//
+// 归属信息必须放在载荷里,不能放包头 —— 包头不参与 FEC 编码,
+// 校验片重构出来的是载荷内容。归属信息若在包头,FEC 恢复出的分片
+// 就认不出自己属于哪条 stream,per-stream 重组无从谈起。
+//
+// streamSeq 独立于全局 seq:全局 seq 仍然只服务 FEC 分组与 NACK 重传,
+// 而交付顺序由 (streamID, streamSeq) 决定。这正是解开队头阻塞的关键 ——
+// 一条 stream 的空洞只挡它自己的 streamSeq 队列,别的 stream 照常交付。
+const shardHdr = 10
+
+func marshalShard(dst []byte, sid, sseq uint32, data []byte) {
+	binary.BigEndian.PutUint32(dst[0:4], sid)
+	binary.BigEndian.PutUint32(dst[4:8], sseq)
+	binary.BigEndian.PutUint16(dst[8:10], uint16(len(data)))
+	copy(dst[shardHdr:], data)
+}
+
+func parseShard(b []byte) (sid, sseq uint32, data []byte, ok bool) {
+	if len(b) < shardHdr {
+		return 0, 0, nil, false
+	}
+	sid = binary.BigEndian.Uint32(b[0:4])
+	sseq = binary.BigEndian.Uint32(b[4:8])
+	n := int(binary.BigEndian.Uint16(b[8:10]))
+	if n > len(b)-shardHdr {
+		return 0, 0, nil, false
+	}
+	return sid, sseq, b[shardHdr : shardHdr+n], true
+}

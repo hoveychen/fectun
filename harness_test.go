@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"net"
@@ -21,10 +22,14 @@ type lossyProxy struct {
 	stopped  bool
 
 	// 确定性丢包:丢弃 seq 落在 [dropFrom, dropTo] 的数据分片(含校验片所属组),
-	// 且每个分片只丢一次 —— 重传可通过,用于构造"尾部连续丢失"场景。
+	// 且每个分片只丢 dropTimes 次 —— 之后的重传可通过,用于构造"尾部连续丢失"场景。
+	//
+	// dropTimes 默认(0)等价于 1。设 >1 可让同一分片连续多轮 ARQ 都补不上,
+	// 用来构造"某段 seq 长时间留空洞"的场景 —— 队头阻塞只有在空洞持续存在时才显形。
 	dropFrom, dropTo uint32
 	dropEnabled      bool
-	dropped          map[string]bool
+	dropTimes        int
+	dropCount        map[string]int
 }
 
 func newLossyProxy(t *testing.T, loss float64, seed int64) *lossyProxy {
@@ -34,7 +39,7 @@ func newLossyProxy(t *testing.T, loss float64, seed int64) *lossyProxy {
 		t.Fatalf("proxy bind: %v", err)
 	}
 	p := &lossyProxy{conn: c, lossRate: loss, rnd: rand.New(rand.NewSource(seed)),
-		dropped: make(map[string]bool)}
+		dropCount: make(map[string]int)}
 	go p.run()
 	return p
 }
@@ -74,8 +79,12 @@ func (p *lossyProxy) run() {
 					sq = h.group * uint32(h.k)
 				}
 				key := fmt.Sprintf("%d-%d", h.group, h.shardIdx)
-				if sq >= p.dropFrom && sq <= p.dropTo && !p.dropped[key] {
-					p.dropped[key] = true
+				limit := p.dropTimes
+				if limit == 0 {
+					limit = 1
+				}
+				if sq >= p.dropFrom && sq <= p.dropTo && p.dropCount[key] < limit {
+					p.dropCount[key]++
 					drop = true
 				}
 			}
@@ -118,7 +127,7 @@ func collect(s *session, want int, timeout time.Duration) []byte {
 	for len(out) < want {
 		select {
 		case p := <-s.deliver:
-			out = append(out, p...)
+			out = append(out, p.data...)
 		case <-deadline:
 			return out
 		}
@@ -361,16 +370,19 @@ func TestDrainDoesNotHoldRecvMuWhenDeliverFull(t *testing.T) {
 	}
 }
 
-// dataShardPkt 拼一个合法的数据分片包,payload 前两字节是有效长度。
+// dataShardPkt 拼一个合法的数据分片包。
+// 载荷走 marshalShard:sid 固定 1、streamSeq 跟全局 seq 同步递增,
+// 接收侧才能连续交付。用裸字节手拼载荷的话 parseShard 会当成越界长度拒收。
 func dataShardPkt(group uint32, idx, k, m int, epoch uint32) []byte {
 	pkt := make([]byte, hdrSize+shardPayload)
+	seq := group*uint32(k) + uint32(idx)
 	header{typ: pktData, shardIdx: byte(idx), k: byte(k), m: byte(m),
-		group: group, seq: group*uint32(k) + uint32(idx), epoch: epoch}.marshal(pkt)
-	body := pkt[hdrSize:]
-	body[0], body[1] = 0, 8 // 每片承载 8 字节有效数据
-	for i := 0; i < 8; i++ {
-		body[2+i] = byte(i)
+		group: group, seq: seq, epoch: epoch}.marshal(pkt)
+	body := make([]byte, 8) // 每片承载 8 字节有效数据
+	for i := range body {
+		body[i] = byte(i)
 	}
+	marshalShard(pkt[hdrSize:], 1, seq, body)
 	return pkt
 }
 
@@ -435,7 +447,7 @@ func TestSendBufferRespectsByteBudget(t *testing.T) {
 	defer s.close()
 
 	const written = 8 << 20 // 远超 25 Mbps 档的预算,足以触发淘汰
-	s.write(payload(written))
+	s.writeStream(1, payload(written))
 
 	s.sendMu.Lock()
 	var held int
@@ -467,7 +479,7 @@ func TestFECRecoversUnderLoss(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // 让心跳建立双向路径
 
 	data := payload(400 * 1024)
-	go a.write(data)
+	go a.writeStream(1, data)
 	got := collect(b, len(data), 20*time.Second)
 	if len(got) != len(data) {
 		t.Fatalf("15%% 丢包下收到 %d/%d 字节", len(got), len(data))
@@ -494,7 +506,7 @@ func TestTailLossIsRecovered(t *testing.T) {
 
 	// 先让一批数据正常通过,把 expected 推进到高位
 	head := payload(shardPayload * 6)
-	go a.write(head)
+	go a.writeStream(1, head)
 	if got := collect(b, len(head), 15*time.Second); len(got) != len(head) {
 		t.Fatalf("前置数据未通过: %d/%d", len(got), len(head))
 	}
@@ -510,7 +522,7 @@ func TestTailLossIsRecovered(t *testing.T) {
 
 	// 这批数据的分片首发会被全丢,且之后没有任何新数据来触发缺口检测
 	tail := payload(shardPayload * 3)
-	go a.write(tail)
+	go a.writeStream(1, tail)
 
 	got := collect(b, len(tail), 20*time.Second)
 	if len(got) != len(tail) {
@@ -531,7 +543,7 @@ func TestPeerRestartRecovery(t *testing.T) {
 
 	// 先推进一批数据,把双方序号推到高位
 	first := payload(200 * 1024)
-	go a.write(first)
+	go a.writeStream(1, first)
 	if got := collect(b, len(first), 15*time.Second); len(got) != len(first) {
 		t.Fatalf("重启前传输就失败: %d/%d", len(got), len(first))
 	}
@@ -561,7 +573,7 @@ func TestPeerRestartRecovery(t *testing.T) {
 	}
 
 	second := payload(100 * 1024)
-	go a2.write(second)
+	go a2.writeStream(1, second)
 	got := collect(b, len(second), 15*time.Second)
 	if len(got) != len(second) {
 		t.Fatalf("对端重启后未自愈: 收到 %d/%d 字节(序号失同步死锁回归)", len(got), len(second))
@@ -587,7 +599,7 @@ func TestEpochChangeResetsState(t *testing.T) {
 	s.recvMu.Lock()
 	s.expected = 5000
 	s.recvHigh = 5001
-	s.recvBuf[5000] = []byte("x")
+	s.recvSeen[5000] = true
 	s.recvMu.Unlock()
 	s.sendMu.Lock()
 	s.nextSeq = 5000
@@ -603,13 +615,13 @@ func TestEpochChangeResetsState(t *testing.T) {
 
 	s.checkEpoch(2000) // epoch 变化,必须重置
 	s.recvMu.Lock()
-	exp, mx, bufLen := s.expected, s.recvHigh, len(s.recvBuf)
+	exp, mx, bufLen := s.expected, s.recvHigh, len(s.recvSeen)
 	s.recvMu.Unlock()
 	s.sendMu.Lock()
 	next := s.nextSeq
 	s.sendMu.Unlock()
 	if exp != 0 || mx != 0 || bufLen != 0 {
-		t.Fatalf("接收状态未重置: expected=%d recvHigh=%d recvBuf=%d", exp, mx, bufLen)
+		t.Fatalf("接收状态未重置: expected=%d recvHigh=%d recvSeen=%d", exp, mx, bufLen)
 	}
 	if next != 0 {
 		t.Fatalf("发送状态未重置: nextSeq=%d", next)
@@ -632,17 +644,42 @@ func TestMuxFrameSpansShards(t *testing.T) {
 	defer b.close()
 	time.Sleep(300 * time.Millisecond)
 
-	// 单帧远大于一个分片(shardPayload-2),必然跨多个分片
+	// 单帧远大于一个分片(shardPayload-shardHdr),必然跨多个分片。
+	// 帧头与数据一次性交给 writeStream —— 分开写会落进不同的 streamSeq,
+	// 而接收侧现在按 stream 独立重组。
 	big := payload(shardPayload * 5)
-	go func() {
-		a.write([]byte{0, 0, 0, 9, cmdData, byte(len(big) >> 8), byte(len(big))})
-		a.write(big)
-	}()
+	frame := append([]byte{0, 0, 0, 9, cmdData, byte(len(big) >> 8), byte(len(big))}, big...)
+	go a.writeStream(9, frame)
 	got := collect(b, frameHdr+len(big), 20*time.Second)
 	if len(got) != frameHdr+len(big) {
 		t.Fatalf("跨分片帧收到 %d/%d 字节", len(got), frameHdr+len(big))
 	}
 	if fmt.Sprintf("%v", got[frameHdr:]) != fmt.Sprintf("%v", big) {
 		t.Fatal("跨分片帧内容不一致")
+	}
+}
+
+func TestShardRoundTrip(t *testing.T) {
+	buf := make([]byte, shardPayload)
+	want := payload(300)
+	marshalShard(buf, 7, 12345, want)
+	sid, sseq, got, ok := parseShard(buf)
+	if !ok {
+		t.Fatalf("parseShard 失败")
+	}
+	if sid != 7 || sseq != 12345 {
+		t.Fatalf("归属解析错:sid=%d sseq=%d", sid, sseq)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("数据不一致:%d 字节 vs %d 字节", len(got), len(want))
+	}
+	// 截断的载荷必须被拒,不能读出越界数据
+	if _, _, _, ok := parseShard(buf[:shardHdr-1]); ok {
+		t.Fatalf("过短的载荷应当解析失败")
+	}
+	bad := make([]byte, shardHdr+10)
+	binary.BigEndian.PutUint16(bad[8:10], 9999)
+	if _, _, _, ok := parseShard(bad); ok {
+		t.Fatalf("dataLen 超出载荷长度时应当解析失败")
 	}
 }

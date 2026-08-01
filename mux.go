@@ -164,33 +164,40 @@ func newStream(m *muxer, sid uint32, c net.Conn) *stream {
 func (m *muxer) sendFrame(sid uint32, cmd byte, data []byte) {
 	m.writeMu.Lock()
 	defer m.writeMu.Unlock()
-	hdr := make([]byte, frameHdr)
-	binary.BigEndian.PutUint32(hdr[0:4], sid)
-	hdr[4] = cmd
-	binary.BigEndian.PutUint16(hdr[5:7], uint16(len(data)))
-	m.sess.write(hdr)
-	if len(data) > 0 {
-		m.sess.write(data)
-	}
+	// 帧头与数据必须一次性交给 writeStream:分开写会让帧头和数据落进
+	// 不同的 streamSeq 甚至不同分片,而接收侧现在按 stream 独立重组。
+	frame := make([]byte, frameHdr+len(data))
+	binary.BigEndian.PutUint32(frame[0:4], sid)
+	frame[4] = cmd
+	binary.BigEndian.PutUint16(frame[5:7], uint16(len(data)))
+	copy(frame[frameHdr:], data)
+	m.sess.writeStream(sid, frame)
 }
 
-// 从可靠层持续读字节流,切出帧并分发
+// 从可靠层持续读数据,按 stream 各自切帧并分发。
+//
+// 帧缓冲必须逐 stream 分开:可靠层现在按 (streamID, streamSeq) 独立交付,
+// 各 stream 的字节之间不再有全局顺序。合用一个 buf 会把 A 的半个帧和 B 的
+// 帧头拼在一起,帧边界当场就错。
 func (m *muxer) recvLoop() {
-	var buf []byte
+	bufs := make(map[uint32][]byte)
 	gen := m.resetGen.Load()
 	for {
+		var c streamChunk
 		select {
-		case p := <-m.sess.deliver:
+		case c = <-m.sess.deliver:
 			// 对端重启后字节流从头开始,此前卡在 buf 里的半个帧已经没有下文了。
 			// 不丢掉的话新字节会被拼到残帧尾部,此后每个帧头都从错位的偏移解析。
 			if g := m.resetGen.Load(); g != gen {
 				gen = g
-				buf = buf[:0]
+				bufs = make(map[uint32][]byte)
 			}
-			buf = append(buf, p...)
+			bufs[c.sid] = append(bufs[c.sid], c.data...)
 		case <-m.sess.closed:
 			return
 		}
+		buf := bufs[c.sid]
+		gone := false
 		for {
 			if len(buf) < frameHdr {
 				break
@@ -205,6 +212,16 @@ func (m *muxer) recvLoop() {
 			copy(payload, buf[frameHdr:frameHdr+n])
 			buf = buf[frameHdr+n:]
 			m.dispatch(sid, cmd, payload)
+			if cmd == cmdClose {
+				gone = true
+			}
+		}
+		// 帧边界对齐(或 stream 已关)就不留空条目 —— 否则每条来过的 stream
+		// 都在这里留一条,又是一份随累计连接数线性增长的常驻内存。
+		if gone || len(buf) == 0 {
+			delete(bufs, c.sid)
+		} else {
+			bufs[c.sid] = buf
 		}
 	}
 }
@@ -442,6 +459,9 @@ func (s *stream) close(notify bool) {
 	if notify {
 		s.mux.sendFrame(s.id, cmdClose, nil)
 	}
+	// 序号记账可以清了。必须排在 sendFrame 之后 —— 清早了这条 cmdClose
+	// 会拿到一个重置回 0 的 streamSeq,对端排不出它相对于此前数据的顺序。
+	s.mux.sess.forgetStream(s.id)
 	fmt.Printf("[mux] stream %d 关闭\n", s.id)
 }
 
