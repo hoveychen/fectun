@@ -43,10 +43,7 @@ func main() {
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		for range t.C {
-			sess.stats.Lock()
-			fmt.Printf("[stat] 收包=%d FEC恢复=%d NACK=%d 重传=%d\n",
-				sess.stats.rawRecv, sess.stats.fecRecovered, sess.stats.nackSent, sess.stats.retransSent)
-			sess.stats.Unlock()
+			fmt.Printf("[stat] %s\n", sess.statsLine())
 		}
 	}()
 
