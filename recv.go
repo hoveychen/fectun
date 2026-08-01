@@ -240,10 +240,41 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 // 阻塞任何 stream 的交付 —— 数据在 acceptShardLocked 里就已经分发出去了。
 // 调用者必须持有 recvMu。
 func (s *session) advanceExpectedLocked() {
+	// 先放弃已经出了 ARQ 视野的空洞,再做正常的连续推进。
+	s.abandonStaleGapsLocked()
 	for s.recvSeen[s.expected] {
 		delete(s.recvSeen, s.expected)
 		delete(s.firstSeen, s.expected)
 		s.expected++
+	}
+}
+
+// abandonStaleGapsLocked 把 expected 强行推到 recvHigh-nackWindow,放弃那之前
+// 一切还没到的 seq。调用者必须持有 recvMu。
+//
+// 为什么必须放弃:落后超过 nackWindow 的空洞已经不可能再补上。一是对端的
+// sendBuf 只按字节预算留约 1 秒的在途数据(见 sendBufBudgetFor),落后几千个
+// 分片时那一片早被淘汰,onNack 拿不到东西、重传不出来;二是 nackLoop 的扫描
+// 窗口本身就只有 [expected, expected+nackWindow),expected 卡住时这个窗口会
+// 停在一段永远填不上的死区上,既把新缺口挡在视野外(rawLost 从此失真),
+// 又持续对死区里的 seq 空发 NACK。
+//
+// 2026-08-01 生产实测(落地侧 own-api-ko):待补涨到 40865(nackWindow 的 10 倍)
+// 且以 +120 seq/s 单调增长,缺口计数冻在 154369,76 NACK/s 全打在入口侧已淘汰
+// 的 seq 上无人应答,recvSeen 随之无界增长。per-stream 交付把功能影响掩掉了
+// (别的 stream 照常收发),所以这条一直没被发现。
+//
+// 放弃空洞不会丢用户数据的账:那一片是真的没到,而它属于哪条 stream 都不知道
+// (归属信息在载荷里,载荷本身丢了)。受影响的那条 stream 由它自己的重组队列
+// 挡着,与全局 expected 无关 —— 这里放弃的只是全局记账,不是交付。
+func (s *session) abandonStaleGapsLocked() {
+	if s.recvHigh <= nackWindow {
+		return
+	}
+	floor := s.recvHigh - nackWindow
+	for ; s.expected < floor; s.expected++ {
+		delete(s.recvSeen, s.expected)
+		delete(s.firstSeen, s.expected)
 	}
 }
 

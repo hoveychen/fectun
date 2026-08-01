@@ -7,6 +7,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -374,6 +375,14 @@ func TestDrainDoesNotHoldRecvMuWhenDeliverFull(t *testing.T) {
 // 载荷走 marshalShard:sid 固定 1、streamSeq 跟全局 seq 同步递增,
 // 接收侧才能连续交付。用裸字节手拼载荷的话 parseShard 会当成越界长度拒收。
 func dataShardPkt(group uint32, idx, k, m int, epoch uint32) []byte {
+	seq := group*uint32(k) + uint32(idx)
+	return dataShardPktOn(group, idx, k, m, epoch, 1, seq)
+}
+
+// dataShardPktOn 同 dataShardPkt,但可单独指定分片归属的 stream 与 stream 内序号。
+// 全局 seq 仍由 (group, idx) 决定 —— 要在全局 seq 上留洞、同时让 stream 内序号
+// 保持连续(这样空洞只影响全局记账、不影响交付)就得把两者解耦。
+func dataShardPktOn(group uint32, idx, k, m int, epoch, sid, sseq uint32) []byte {
 	pkt := make([]byte, hdrSize+shardPayload)
 	seq := group*uint32(k) + uint32(idx)
 	header{typ: pktData, shardIdx: byte(idx), k: byte(k), m: byte(m),
@@ -382,7 +391,7 @@ func dataShardPkt(group uint32, idx, k, m int, epoch uint32) []byte {
 	for i := range body {
 		body[i] = byte(i)
 	}
-	marshalShard(pkt[hdrSize:], 1, seq, body)
+	marshalShard(pkt[hdrSize:], sid, sseq, body)
 	return pkt
 }
 
@@ -878,5 +887,89 @@ func TestFECCoversPartialGroupUnderLowTraffic(t *testing.T) {
 	if fec == 0 {
 		t.Fatalf("丢了一片却没有任何 FEC 恢复(nackSent=%d)—— 组攒不满,"+
 			"校验片压根没发出来,只能靠 ARQ 兜底", nacks)
+	}
+}
+
+// 回归:撞上不可填补的空洞时,全局 expected 必须能继续推进。
+//
+// 2026-08-01 生产实测(落地侧 own-api-ko):待补涨到 40865 —— nackWindow 的 10 倍
+// 且单调增长(约 +120 seq/s,正好是数据片到达速率),缺口计数冻在 154369 不动,
+// 却仍以 76 NACK/s 往外发,而入口侧「重传」冻着不动 —— 这些 NACK 打的全是
+// 对端 sendBuf 已淘汰的 seq,无人应答,那个空洞永远填不上。
+//
+// 后果有两条:recvSeen/firstSeen 永不回收(内存无界增长),以及 NACK 扫描窗口
+// [expected, expected+nackWindow) 停在一段死区上空转,新缺口不再进入视野
+// (缺口这个指标就此失真)。per-stream 交付把功能影响掩掉了,所以没人发现。
+func TestExpectedAdvancesPastUnfillableHole(t *testing.T) {
+	const k, m = 20, 15
+	// 喂满 400 组 = 8000 个 seq,是 nackWindow(4096) 的近 2 倍,
+	// 足以把"待补无界"和"待补被钉在窗口内"两种行为区分开。
+	const groups = 400
+
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	// peer 指向一个没人监听的端口:NACK 发得出去但永远没人应答,
+	// 这正是生产里那个空洞的处境(对端 sendBuf 已经淘汰了那一片)。
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, k, m, 100)
+	defer s.close()
+
+	// 持续排空交付,否则 deliver(4096)填满后 onPacket 会阻塞在背压上。
+	var delivered int64
+	go func() {
+		for {
+			select {
+			case p := <-s.deliver:
+				atomic.AddInt64(&delivered, int64(len(p.data)))
+			case <-s.closed:
+				return
+			}
+		}
+	}()
+
+	// stream 内序号必须连续,空洞只留在全局 seq 上 —— 否则卡住的是 stream
+	// 重组而不是全局 expected,测不到本例要测的东西。
+	var sseq uint32
+	feed := func(group uint32, idx int) {
+		s.onPacket(dataShardPktOn(group, idx, k, m, 0, 2, sseq))
+		sseq++
+	}
+
+	// group 0 只喂后 10 片:数据片 0..9 缺失,且到手分片数(10)不足 k,
+	// FEC 也救不回来 —— 一个既补不上、也恢复不了的永久空洞。
+	for idx := 10; idx < k; idx++ {
+		feed(0, idx)
+	}
+	// 其余组全喂满,让 recvHigh 一路爬到远超 nackWindow 的位置。
+	for g := 1; g <= groups; g++ {
+		for idx := 0; idx < k; idx++ {
+			feed(uint32(g), idx)
+		}
+	}
+
+	// 给 nackLoop(40ms 一跳)几次机会,让它把该发的 NACK 发完。
+	time.Sleep(300 * time.Millisecond)
+
+	s.recvMu.Lock()
+	gap := s.recvHigh - s.expected
+	seen := len(s.recvSeen)
+	first := len(s.firstSeen)
+	s.recvMu.Unlock()
+
+	if gap > nackWindow {
+		t.Errorf("待补=%d 超出 nackWindow=%d:expected 卡死在填不上的空洞前,"+
+			"NACK 扫描窗口停在死区空转", gap, nackWindow)
+	}
+	if seen > nackWindow {
+		t.Errorf("recvSeen=%d 条超出 nackWindow=%d:expected 不推进,"+
+			"记账永不回收 —— 这就是生产上那份随流量线性增长的常驻内存", seen, nackWindow)
+	}
+	if first > nackWindow {
+		t.Errorf("firstSeen=%d 条超出 nackWindow=%d", first, nackWindow)
+	}
+	// 反向保险:修复不能是"干脆不收包了"。
+	if n := atomic.LoadInt64(&delivered); n == 0 {
+		t.Errorf("一个字节都没交付,空洞之后的分片本该照常送达")
 	}
 }
