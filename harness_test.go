@@ -761,3 +761,56 @@ func TestReceiverStateStaysBoundedUnderLoss(t *testing.T) {
 			peakSeen, nackWindow)
 	}
 }
+
+// 回归:需要 ARQ 兜底的缺口必须被记账。
+//
+// rawLost 从一开始就声明在 stats 结构里,却没有任何一处写它 —— 于是"有多少
+// 分片没能被 FEC 当场救回、要靠重传补"这个数在生产上完全不可观测。
+// 2026-08-01 排查队头阻塞时,真实丢包率只能从 fecRecovered 与 nackSent 反推,
+// 就是因为缺这个数。
+func TestLostShardsAreCounted(t *testing.T) {
+	px := newLossyProxy(t, 0, 33)
+	defer px.stop()
+	a := newTestSession(t, px.port(), 20, 15, 500)
+	b := newTestSession(t, px.port(), 20, 15, 500)
+	defer a.close()
+	defer b.close()
+	time.Sleep(300 * time.Millisecond)
+
+	// 先让一批正常通过,把 expected 推上去
+	head := payload(shardPayload * 6)
+	go a.writeStream(1, head)
+	if got := collect(b, len(head), 15*time.Second); len(got) != len(head) {
+		t.Fatalf("前置数据未通过: %d/%d", len(got), len(head))
+	}
+
+	// 构造整组丢失:FEC 救不回,必须走 ARQ
+	a.sendMu.Lock()
+	from := a.nextSeq
+	a.sendMu.Unlock()
+	px.mu.Lock()
+	px.dropEnabled = true
+	px.dropFrom, px.dropTo = from, from+9
+	px.mu.Unlock()
+
+	tail := payload(shardPayload * 3)
+	go a.writeStream(1, tail)
+	if got := collect(b, len(tail), 20*time.Second); len(got) != len(tail) {
+		t.Fatalf("尾部数据未恢复: %d/%d", len(got), len(tail))
+	}
+
+	b.stats.Lock()
+	lost, nacks, fec := b.stats.rawLost, b.stats.nackSent, b.stats.fecRecovered
+	b.stats.Unlock()
+
+	if nacks == 0 {
+		t.Fatal("前置条件不成立:一个 NACK 都没发,没走到 ARQ 路径(测试无效)")
+	}
+	if lost == 0 {
+		t.Fatalf("发了 %d 个 NACK、FEC 恢复 %d 片,rawLost 却是 0 —— 缺口没有被记账", nacks, fec)
+	}
+	// 同一个缺口在退避后会被反复 NACK,但只该在首次发现时计一次。
+	if lost > nacks {
+		t.Fatalf("rawLost=%d 超过 nackSent=%d —— 同一缺口被重复计数", lost, nacks)
+	}
+}
