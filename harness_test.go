@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/binary"
 	"fmt"
 	"math/rand"
 	"net"
@@ -652,5 +653,30 @@ func TestMuxFrameSpansShards(t *testing.T) {
 	}
 	if fmt.Sprintf("%v", got[frameHdr:]) != fmt.Sprintf("%v", big) {
 		t.Fatal("跨分片帧内容不一致")
+	}
+}
+
+func TestShardRoundTrip(t *testing.T) {
+	buf := make([]byte, shardPayload)
+	want := payload(300)
+	marshalShard(buf, 7, 12345, want)
+	sid, sseq, got, ok := parseShard(buf)
+	if !ok {
+		t.Fatalf("parseShard 失败")
+	}
+	if sid != 7 || sseq != 12345 {
+		t.Fatalf("归属解析错:sid=%d sseq=%d", sid, sseq)
+	}
+	if string(got) != string(want) {
+		t.Fatalf("数据不一致:%d 字节 vs %d 字节", len(got), len(want))
+	}
+	// 截断的载荷必须被拒,不能读出越界数据
+	if _, _, _, ok := parseShard(buf[:shardHdr-1]); ok {
+		t.Fatalf("过短的载荷应当解析失败")
+	}
+	bad := make([]byte, shardHdr+10)
+	binary.BigEndian.PutUint16(bad[8:10], 9999)
+	if _, _, _, ok := parseShard(bad); ok {
+		t.Fatalf("dataLen 超出载荷长度时应当解析失败")
 	}
 }
