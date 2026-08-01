@@ -762,12 +762,17 @@ func TestReceiverStateStaysBoundedUnderLoss(t *testing.T) {
 	}
 }
 
-// 回归:需要 ARQ 兜底的缺口必须被记账。
+// 回归:nackLoop 发现的缺口必须被记账,且同一缺口只记一次。
 //
 // rawLost 从一开始就声明在 stats 结构里,却没有任何一处写它 —— 于是"有多少
-// 分片没能被 FEC 当场救回、要靠重传补"这个数在生产上完全不可观测。
-// 2026-08-01 排查队头阻塞时,真实丢包率只能从 fecRecovered 与 nackSent 反推,
-// 就是因为缺这个数。
+// 分片没能被 FEC 当场救回"这个数在生产上完全不可观测。2026-08-01 排查队头
+// 阻塞时,真实丢包率只能从 fecRecovered 与 nackSent 反推,就是因为缺这个数。
+//
+// 语义要说准:rawLost 记的是"nackLoop 扫描时仍缺失的 seq",这里面**包含
+// 乱序造成的短暂缺口** —— 它们会在 120ms 内自愈,压根不会触发 NACK。
+// 所以 rawLost 既不等于链路丢包(FEC 当场救回的不进统计),也不等于 ARQ 负担
+// (自愈的那些不发 NACK)。2026-08-01 生产实测 缺口=6321 而 NACK=1291,
+// 约八成缺口是自愈的。
 func TestLostShardsAreCounted(t *testing.T) {
 	px := newLossyProxy(t, 0, 33)
 	defer px.stop()
@@ -784,12 +789,15 @@ func TestLostShardsAreCounted(t *testing.T) {
 		t.Fatalf("前置数据未通过: %d/%d", len(got), len(head))
 	}
 
-	// 构造整组丢失:FEC 救不回,必须走 ARQ
+	// 构造整组丢失且连丢多轮:FEC 救不回,每个洞都要被 nackLoop 反复请求。
+	// dropTimes>1 是这个测试的关键 —— 只有缺口持续存在,才能验证"反复 NACK
+	// 但只记一次账"。
 	a.sendMu.Lock()
 	from := a.nextSeq
 	a.sendMu.Unlock()
 	px.mu.Lock()
 	px.dropEnabled = true
+	px.dropTimes = 3
 	px.dropFrom, px.dropTo = from, from+9
 	px.mu.Unlock()
 
@@ -809,8 +817,13 @@ func TestLostShardsAreCounted(t *testing.T) {
 	if lost == 0 {
 		t.Fatalf("发了 %d 个 NACK、FEC 恢复 %d 片,rawLost 却是 0 —— 缺口没有被记账", nacks, fec)
 	}
-	// 同一个缺口在退避后会被反复 NACK,但只该在首次发现时计一次。
-	if lost > nacks {
-		t.Fatalf("rawLost=%d 超过 nackSent=%d —— 同一缺口被重复计数", lost, nacks)
+	// 去重校验:dropTimes=3 让每个洞至少被请求三轮,nackSent 会数倍于洞的个数,
+	// 而 rawLost 只在首次发现时 +1。所以持久缺口下 rawLost 必须严格小于 nackSent。
+	//
+	// 注意不能反过来断言 rawLost <= nackSent 就算过 —— 那个不变量根本不成立:
+	// 乱序造成的短暂缺口会计入 rawLost 却从不发 NACK,生产上实测 6321 vs 1291。
+	if lost >= nacks {
+		t.Fatalf("rawLost=%d 不小于 nackSent=%d —— 每个洞被反复 NACK 了三轮,"+
+			"rawLost 却没有去重", lost, nacks)
 	}
 }
