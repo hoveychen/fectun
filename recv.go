@@ -82,18 +82,18 @@ func (s *session) onPacket(b []byte) {
 			g[h.shardIdx] = payload
 		}
 	}
-	// 数据片直接入重组缓冲
+	// 数据片:记下全局 seq(供 NACK 缺口检测),并立刻按归属分发。
+	// 关键是"立刻"—— 不再等全局 expected 连续推进到它。
+	var ready []streamChunk
 	if int(h.shardIdx) < k {
 		seq := h.group*uint32(k) + uint32(h.shardIdx)
 		if seq+1 > s.recvHigh {
 			s.recvHigh = seq + 1
 		}
-		if seq >= s.expected && s.recvBuf[seq] == nil {
-			s.recvBuf[seq] = payload
-		}
+		ready = s.acceptShardLocked(seq, payload)
 	}
-	s.tryRecover(h.group)
-	ready := s.drainLocked()
+	ready = append(ready, s.tryRecover(h.group)...)
+	s.advanceExpectedLocked()
 	s.pruneGroups()
 	s.recvMu.Unlock()
 
@@ -123,14 +123,17 @@ func (s *session) pruneGroups() {
 	}
 }
 
-// FEC 恢复:组内收到 >= k 片即可重构全部数据片
-func (s *session) tryRecover(group uint32) {
+// FEC 恢复:组内收到 >= k 片即可重构全部数据片。
+// 恢复出的分片和直达分片走同一条路 —— 载荷里带着 (streamID, streamSeq),
+// 所以恢复出来立刻就知道该归给哪条 stream。这正是归属信息必须放在载荷里、
+// 不能放包头的原因:包头不参与 FEC 编码,重构不出来。
+func (s *session) tryRecover(group uint32) []streamChunk {
 	if s.groupDone[group] {
-		return
+		return nil
 	}
 	g := s.groups[group]
 	if g == nil {
-		return
+		return nil
 	}
 	present, dataMissing := 0, 0
 	for i, sh := range g {
@@ -143,24 +146,28 @@ func (s *session) tryRecover(group uint32) {
 	if dataMissing == 0 {
 		s.groupDone[group] = true
 		delete(s.groups, group)
-		return
+		return nil
 	}
 	if present < s.k {
-		return // 还不够,等更多分片或走 NACK
+		return nil // 还不够,等更多分片或走 NACK
 	}
 	if err := s.enc.Reconstruct(g); err != nil {
-		return
+		return nil
 	}
 	recovered := 0
+	var ready []streamChunk
 	for i := 0; i < s.k; i++ {
 		seq := group*uint32(s.k) + uint32(i)
 		if seq+1 > s.recvHigh {
 			s.recvHigh = seq + 1
 		}
-		if seq >= s.expected && s.recvBuf[seq] == nil && g[i] != nil {
-			s.recvBuf[seq] = g[i]
+		if g[i] == nil {
+			continue
+		}
+		if seq >= s.expected && !s.recvSeen[seq] {
 			recovered++
 		}
+		ready = append(ready, s.acceptShardLocked(seq, g[i])...)
 	}
 	s.groupDone[group] = true
 	delete(s.groups, group)
@@ -169,32 +176,67 @@ func (s *session) tryRecover(group uint32) {
 		s.stats.fecRecovered += uint64(recovered)
 		s.stats.Unlock()
 	}
+	return ready
 }
 
-// 按序交付连续到达的分片
-// drainLocked 取出连续到达的分片、推进 expected,并把待交付的字节按序收集返回。
+// acceptShardLocked 收下一个已到达的数据分片:记下它的全局 seq(供 NACK 检测),
+// 解出归属,投进对应 stream 的重组队列,并把该 stream 因此变得连续的部分收集返回。
+//
 // 它自己不往 deliver 写 —— 写 channel 会阻塞,而这里持着 recvMu。
 // 调用者必须持有 recvMu,并在释放锁之后调 deliverAll。
-func (s *session) drainLocked() [][]byte {
-	var ready [][]byte
+func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
+	// seq < expected 说明这一片早已处理过并从 recvSeen 清掉了;recvSeen 命中
+	// 则是重复到达(FEC 恢复与直达包撞车,或迟到的重传)。两种都不能重复交付。
+	if seq < s.expected || s.recvSeen[seq] {
+		return nil
+	}
+	s.recvSeen[seq] = true
+
+	sid, sseq, data, ok := parseShard(shard)
+	if !ok {
+		return nil
+	}
+	r := s.streamRecv[sid]
+	if r == nil {
+		r = &streamReasm{buf: make(map[uint32][]byte)}
+		s.streamRecv[sid] = r
+	}
+	if sseq < r.expected {
+		return nil // 这一片该 stream 已经交付过了
+	}
+	if r.buf[sseq] == nil {
+		out := make([]byte, len(data))
+		copy(out, data)
+		r.buf[sseq] = out
+	}
+
+	// 只取该 stream 连续的部分。别的 stream 有没有空洞,与这里无关 ——
+	// 这一行就是队头阻塞被解开的地方。
+	var ready []streamChunk
 	for {
-		sh := s.recvBuf[s.expected]
-		if sh == nil {
-			return ready
+		d, ok := r.buf[r.expected]
+		if !ok {
+			break
 		}
-		delete(s.recvBuf, s.expected)
+		delete(r.buf, r.expected)
+		r.expected++
+		if len(d) > 0 {
+			ready = append(ready, streamChunk{sid: sid, data: d})
+		}
+	}
+	return ready
+}
+
+// advanceExpectedLocked 推进全局 expected 并回收记账。
+//
+// 全局 seq 现在只剩一个用途:给 nackLoop 划定缺口扫描的下界。它卡住不再
+// 阻塞任何 stream 的交付 —— 数据在 acceptShardLocked 里就已经分发出去了。
+// 调用者必须持有 recvMu。
+func (s *session) advanceExpectedLocked() {
+	for s.recvSeen[s.expected] {
+		delete(s.recvSeen, s.expected)
 		delete(s.firstSeen, s.expected)
 		s.expected++
-		if len(sh) < 2 {
-			continue
-		}
-		n := int(sh[0])<<8 | int(sh[1])
-		if n <= 0 || n > len(sh)-2 {
-			continue
-		}
-		out := make([]byte, n)
-		copy(out, sh[2:2+n])
-		ready = append(ready, out)
 	}
 }
 
@@ -202,7 +244,7 @@ func (s *session) drainLocked() [][]byte {
 // 顺序性由调用方保证:onPacket 只由单个 readLoop goroutine 串行调用,
 // 所以收集与交付都是串行的,字节流顺序不会乱。
 // 这里阻塞是正确的背压 —— UDP 包会在内核缓冲排队,而 recvMu 是空闲的。
-func (s *session) deliverAll(ready [][]byte) {
+func (s *session) deliverAll(ready []streamChunk) {
 	for _, out := range ready {
 		select {
 		case s.deliver <- out:
@@ -234,7 +276,7 @@ func (s *session) nackLoop() {
 		now := time.Now()
 		// 开区间:q < high。recvHigh==0 时循环不执行,空载不会误发 NACK。
 		for q := s.expected; q < high && len(want) < 32; q++ {
-			if s.recvBuf[q] != nil {
+			if s.recvSeen[q] {
 				continue
 			}
 			if f, ok := s.firstSeen[q]; !ok {
@@ -305,10 +347,13 @@ func (s *session) resetRecvLocked() {
 	s.recvHigh = 0
 	s.lowHbStreak = 0
 	s.prunedGroup = 0
-	s.recvBuf = make(map[uint32][]byte)
+	s.recvSeen = make(map[uint32]bool)
 	s.groups = make(map[uint32][][]byte)
 	s.groupDone = make(map[uint32]bool)
 	s.firstSeen = make(map[uint32]time.Time)
+	// 对端重启后 stream 全部作废,重组队列里的残片没有下文了。
+	// 留着它们的话,新 stream 若复用了同一个 sid,残片会被当成新数据接上去。
+	s.streamRecv = make(map[uint32]*streamReasm)
 }
 
 // resetSendAndNotify 把发送侧归零并通知上层重建 stream。
@@ -318,6 +363,7 @@ func (s *session) resetSendAndNotify() {
 	s.nextSeq = 0
 	s.curGroup = nil
 	s.sendBuf = make(map[uint32][]byte)
+	s.sendSeqOf = make(map[uint32]uint32)
 	s.sendBufBytes = 0
 	s.sendBufTail = 0
 	s.sendMu.Unlock()

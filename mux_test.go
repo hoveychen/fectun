@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -534,9 +535,11 @@ func TestResetClearsFrameBuffer(t *testing.T) {
 	defer srvSess.close()
 	srvMux := newMuxer(srvSess, true, echoAddr)
 
-	// 1. 对端重启前:一个被截断的帧卡在 recvLoop 的 buf 里。
+	// 1. 对端重启前:一个被截断的帧卡在 recvLoop 里该 stream 的 buf 中。
 	//    帧头要 7 字节,这里只送 3 字节,recvLoop 会 break 出内层循环等后续字节。
-	srvSess.deliver <- []byte{0xAA, 0xBB, 0xCC}
+	//    残帧必须和后续的新帧同属一个 sid,否则它们落进不同的 buf,污染不到。
+	const wantSID = 42
+	srvSess.deliver <- streamChunk{sid: wantSID, data: []byte{0xAA, 0xBB, 0xCC}}
 	time.Sleep(100 * time.Millisecond)
 
 	// 2. 对端重启 → session 层重置序号空间 → onReset → resetAll
@@ -544,12 +547,11 @@ func TestResetClearsFrameBuffer(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 
 	// 3. 重启后对端从干净的字节流重新开始:一个完整的 cmdOpen(sid=42)
-	const wantSID = 42
 	frame := make([]byte, frameHdr)
 	binary.BigEndian.PutUint32(frame[0:4], wantSID)
 	frame[4] = cmdOpen
 	binary.BigEndian.PutUint16(frame[5:7], 0)
-	srvSess.deliver <- frame
+	srvSess.deliver <- streamChunk{sid: wantSID, data: frame}
 
 	// 4. server 侧应据此连上 target 并登记 stream 42
 	deadline := time.Now().Add(3 * time.Second)
@@ -632,7 +634,7 @@ func TestLostShardDoesNotStallOtherStreams(t *testing.T) {
 	px.dropEnabled = true
 	px.mu.Unlock()
 
-	if _, err := a.Write(payload(160 << 10)); err != nil {
+	if _, err := a.Write(payload(320 << 10)); err != nil {
 		t.Fatalf("stream A 二次写入失败: %v", err)
 	}
 	// 等 A 这批数据全部发出(seq 越过丢包窗口),B 的分片才不会落进窗口里
@@ -660,8 +662,15 @@ func TestLostShardDoesNotStallOtherStreams(t *testing.T) {
 	buf := make([]byte, 64)
 	n, err := b.Read(buf)
 	if err != nil || string(buf[:n]) != "ping" {
+		srvSess.recvMu.Lock()
+		detail := fmt.Sprintf("srv expected=%d recvHigh=%d seen=%d",
+			srvSess.expected, srvSess.recvHigh, len(srvSess.recvSeen))
+		for sid, r := range srvSess.streamRecv {
+			detail += fmt.Sprintf(" | sid=%d exp=%d buffered=%d", sid, r.expected, len(r.buf))
+		}
+		srvSess.recvMu.Unlock()
 		t.Fatalf("stream B 在 %v 内没拿到回显(收到 %q, err=%v)"+
-			" —— stream A 的分片空洞把整条隧道的交付卡住了",
-			time.Since(start), buf[:n], err)
+			" —— stream A 的分片空洞把整条隧道的交付卡住了\n%s",
+			time.Since(start), buf[:n], err, detail)
 	}
 }
