@@ -21,10 +21,14 @@ type lossyProxy struct {
 	stopped  bool
 
 	// 确定性丢包:丢弃 seq 落在 [dropFrom, dropTo] 的数据分片(含校验片所属组),
-	// 且每个分片只丢一次 —— 重传可通过,用于构造"尾部连续丢失"场景。
+	// 且每个分片只丢 dropTimes 次 —— 之后的重传可通过,用于构造"尾部连续丢失"场景。
+	//
+	// dropTimes 默认(0)等价于 1。设 >1 可让同一分片连续多轮 ARQ 都补不上,
+	// 用来构造"某段 seq 长时间留空洞"的场景 —— 队头阻塞只有在空洞持续存在时才显形。
 	dropFrom, dropTo uint32
 	dropEnabled      bool
-	dropped          map[string]bool
+	dropTimes        int
+	dropCount        map[string]int
 }
 
 func newLossyProxy(t *testing.T, loss float64, seed int64) *lossyProxy {
@@ -34,7 +38,7 @@ func newLossyProxy(t *testing.T, loss float64, seed int64) *lossyProxy {
 		t.Fatalf("proxy bind: %v", err)
 	}
 	p := &lossyProxy{conn: c, lossRate: loss, rnd: rand.New(rand.NewSource(seed)),
-		dropped: make(map[string]bool)}
+		dropCount: make(map[string]int)}
 	go p.run()
 	return p
 }
@@ -74,8 +78,12 @@ func (p *lossyProxy) run() {
 					sq = h.group * uint32(h.k)
 				}
 				key := fmt.Sprintf("%d-%d", h.group, h.shardIdx)
-				if sq >= p.dropFrom && sq <= p.dropTo && !p.dropped[key] {
-					p.dropped[key] = true
+				limit := p.dropTimes
+				if limit == 0 {
+					limit = 1
+				}
+				if sq >= p.dropFrom && sq <= p.dropTo && p.dropCount[key] < limit {
+					p.dropCount[key]++
 					drop = true
 				}
 			}
