@@ -273,6 +273,7 @@ func (s *session) nackLoop() {
 			high = s.expected + nackWindow
 		}
 		var want []uint32
+		newGaps := 0
 		now := time.Now()
 		// 开区间:q < high。recvHigh==0 时循环不执行,空载不会误发 NACK。
 		for q := s.expected; q < high && len(want) < 32; q++ {
@@ -280,13 +281,24 @@ func (s *session) nackLoop() {
 				continue
 			}
 			if f, ok := s.firstSeen[q]; !ok {
+				// 首次发现这个缺口。FEC 能当场救回的分片根本不会走到这里
+				// (recvSeen 已置位),所以 rawLost 记的是"FEC 没接住、
+				// 要靠 ARQ 兜底"的量,不是链路总丢包。
+				// 只在首次计一次 —— 同一缺口退避后会被反复 NACK。
 				s.firstSeen[q] = now
+				newGaps++
 			} else if now.Sub(f) > 120*time.Millisecond {
 				want = append(want, q)
 				s.firstSeen[q] = now // 退避后可再次请求
 			}
 		}
 		s.recvMu.Unlock()
+
+		if newGaps > 0 {
+			s.stats.Lock()
+			s.stats.rawLost += uint64(newGaps)
+			s.stats.Unlock()
+		}
 		for _, q := range want {
 			header{typ: pktNack, seq: q}.marshal(buf)
 			s.conn.WriteToUDP(buf, s.peer)

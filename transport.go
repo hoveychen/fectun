@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -319,4 +320,30 @@ func (s *session) close() {
 		close(s.closed)
 	}
 	s.conn.Close()
+}
+
+// statsLine 拼一行运行统计。
+//
+// 分两次取锁而非嵌套:onPacket 持 recvMu 期间会去拿 stats 锁,这里若反序
+// 嵌套(先 stats 再 recvMu)就是经典的锁顺序反转,压力下会死锁。
+//
+// 各字段语义:
+//   收包   本端收到的数据分片总数
+//   缺口   FEC 没能当场救回、进了 NACK 视野的分片数(每个缺口只计一次)
+//   FEC恢复 靠校验片重构回来的分片数
+//   NACK   本端发出的重传请求数(同一缺口退避后会重发,故 ≥ 缺口数)
+//   重传   本端应对端请求发出的重传数
+//   待补   此刻仍在等的 seq 跨度(recvHigh-expected),持续不落零说明有洞补不上
+//   stream 当前有重组状态的 stream 数
+func (s *session) statsLine() string {
+	s.recvMu.Lock()
+	gap := s.recvHigh - s.expected
+	streams := len(s.streamRecv)
+	s.recvMu.Unlock()
+
+	s.stats.Lock()
+	defer s.stats.Unlock()
+	return fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d",
+		s.stats.rawRecv, s.stats.rawLost, s.stats.fecRecovered,
+		s.stats.nackSent, s.stats.retransSent, gap, streams)
 }
