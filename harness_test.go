@@ -683,3 +683,81 @@ func TestShardRoundTrip(t *testing.T) {
 		t.Fatalf("dataLen 超出载荷长度时应当解析失败")
 	}
 }
+
+// 回归:高丢包 + 持续流量下,接收侧各记账结构必须有界。
+//
+// per-stream 重组拆掉了一个隐式自限 —— 从前 expected 卡住时交付也停,上层 TCP
+// 收不到数据就不再发,流量自然降下来。现在交付不再受全局 expected 约束,而
+// recvSeen 仍按全局 seq 记账,所以它必须自己守住有界,不能再指望背压兜底。
+//
+// 2026-08-01 实测(15% 丢包满载):recvSeen 峰值仅 14,groupDone 稳定在
+// groupKeepWindow(128)。同日生产上一度观察到 RSS 18 分钟涨到 75 MB,查明是
+// 25 并发压测(2056 包/s,稳态 38 包/s 的 54 倍)抬高的 Go 堆水位,不是泄漏 ——
+// 撤掉压测后稳态回到 16 MB。这个测试守的就是"别真的变成泄漏"。
+func TestReceiverStateStaysBoundedUnderLoss(t *testing.T) {
+	px := newLossyProxy(t, 0.15, 5)
+	defer px.stop()
+	a := newTestSession(t, px.port(), 20, 15, 100)
+	b := newTestSession(t, px.port(), 20, 15, 100)
+	defer a.close()
+	defer b.close()
+	time.Sleep(300 * time.Millisecond)
+
+	// 上层持续消费 —— 新版的关键前提:交付不再被全局 expected 阻塞,
+	// 所以流量不会因为某个 seq 卡住而自然停下来。
+	go func() {
+		for {
+			select {
+			case <-b.deliver:
+			case <-b.closed:
+				return
+			}
+		}
+	}()
+
+	stop := make(chan struct{})
+	go func() {
+		data := payload(32 << 10)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				a.writeStream(1, data)
+			}
+		}
+	}()
+
+	var peakSeen int
+	snap := func(label string) {
+		b.recvMu.Lock()
+		seen, groups, gdone, first := len(b.recvSeen), len(b.groups), len(b.groupDone), len(b.firstSeen)
+		buffered := 0
+		for _, r := range b.streamRecv {
+			buffered += len(r.buf)
+		}
+		nstream, exp, high := len(b.streamRecv), b.expected, b.recvHigh
+		b.recvMu.Unlock()
+		a.sendMu.Lock()
+		sbuf, sbytes := len(a.sendBuf), a.sendBufBytes
+		a.sendMu.Unlock()
+		if seen > peakSeen {
+			peakSeen = seen
+		}
+		t.Logf("%s recvSeen=%-7d streams=%-3d streamBuf=%-6d groups=%-5d groupDone=%-6d firstSeen=%-6d gap=%-7d sendBuf=%d(%.1fMB)",
+			label, seen, nstream, buffered, groups, gdone, first, high-exp, sbuf, float64(sbytes)/(1<<20))
+	}
+
+	for i := 1; i <= 8; i++ {
+		time.Sleep(2 * time.Second)
+		snap(fmt.Sprintf("t=%2ds", i*2))
+	}
+	close(stop)
+
+	// recvSeen 是最可疑的:它只在 expected 连续推进时才删,没有窗口上限。
+	// nackWindow=4096 是 NACK 扫描的窗口,记账结构理应同阶。
+	if peakSeen > 4*nackWindow {
+		t.Fatalf("recvSeen 峰值 %d 条,远超 nackWindow(%d) 的量级 —— 按全局 seq 的记账失去上限",
+			peakSeen, nackWindow)
+	}
+}
