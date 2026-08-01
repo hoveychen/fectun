@@ -789,19 +789,20 @@ func TestLostShardsAreCounted(t *testing.T) {
 		t.Fatalf("前置数据未通过: %d/%d", len(got), len(head))
 	}
 
-	// 构造整组丢失且连丢多轮:FEC 救不回,每个洞都要被 nackLoop 反复请求。
-	// dropTimes>1 是这个测试的关键 —— 只有缺口持续存在,才能验证"反复 NACK
-	// 但只记一次账"。
+	// 构造整组丢失且连丢多轮。要丢够 18 片(> m=15)FEC 才真的救不回 ——
+	// 自从有了 groupFlushAfter 的补零 flush,校验片不再依赖组自然攒满,
+	// 少量丢失会被 FEC 当场接住、压根走不到 ARQ,这个测试就失去前置条件了。
+	// dropTimes>1 是另一个关键:只有缺口持续存在,才能验证"反复 NACK 但只记一次账"。
 	a.sendMu.Lock()
 	from := a.nextSeq
 	a.sendMu.Unlock()
 	px.mu.Lock()
 	px.dropEnabled = true
 	px.dropTimes = 3
-	px.dropFrom, px.dropTo = from, from+9
+	px.dropFrom, px.dropTo = from, from+17
 	px.mu.Unlock()
 
-	tail := payload(shardPayload * 3)
+	tail := payload((shardPayload - shardHdr) * 20)
 	go a.writeStream(1, tail)
 	if got := collect(b, len(tail), 20*time.Second); len(got) != len(tail) {
 		t.Fatalf("尾部数据未恢复: %d/%d", len(got), len(tail))
@@ -825,5 +826,57 @@ func TestLostShardsAreCounted(t *testing.T) {
 	if lost >= nacks {
 		t.Fatalf("rawLost=%d 不小于 nackSent=%d —— 每个洞被反复 NACK 了三轮,"+
 			"rawLost 却没有去重", lost, nacks)
+	}
+}
+
+// 回归:低流量下 FEC 必须赶在 ARQ 前面。
+//
+// 校验片要等整组 k 片攒齐才发。低流量时攒不满,校验片就永远发不出去,FEC 形同
+// 虚设 —— 丢一片只能靠 ARQ 的 120ms 判定加一个重传往返。
+//
+// 2026-08-01 生产实测:927 包/s 时攒一组 22ms,NACK 率 0.17%;流量掉到
+// 110 包/s 后攒一组要 182ms、超过 120ms 判定,NACK 率升到 1.9% —— 那些重传
+// 全是白跑的,校验片其实还在发送侧攒着。
+//
+// 断言用 fecRecovered 而非耗时:ARQ 最终也能把数据补回来,区别只在"谁救的"。
+// 用时间阈值区分会在慢机器上 flaky,用语义就不会。
+func TestFECCoversPartialGroupUnderLowTraffic(t *testing.T) {
+	px := newLossyProxy(t, 0, 71)
+	defer px.stop()
+	a := newTestSession(t, px.port(), 20, 15, 500)
+	b := newTestSession(t, px.port(), 20, 15, 500)
+	defer a.close()
+	defer b.close()
+	time.Sleep(300 * time.Millisecond)
+
+	// 只发 8 片 —— 不足 k=20 但超过 k/4 的 flush 门槛,靠自然攒永远满不了
+	a.sendMu.Lock()
+	from := a.nextSeq
+	a.sendMu.Unlock()
+	px.mu.Lock()
+	px.dropEnabled = true
+	px.dropFrom, px.dropTo = from+1, from+1 // 只丢第二片
+	px.mu.Unlock()
+
+	data := payload((shardPayload - shardHdr) * 8)
+	go a.writeStream(1, data)
+
+	got := collect(b, len(data), 5*time.Second)
+	if len(got) != len(data) {
+		t.Fatalf("数据未送达: %d/%d 字节", len(got), len(data))
+	}
+	for i := range data {
+		if got[i] != data[i] {
+			t.Fatalf("字节 %d 不一致", i)
+		}
+	}
+
+	b.stats.Lock()
+	fec, nacks := b.stats.fecRecovered, b.stats.nackSent
+	b.stats.Unlock()
+
+	if fec == 0 {
+		t.Fatalf("丢了一片却没有任何 FEC 恢复(nackSent=%d)—— 组攒不满,"+
+			"校验片压根没发出来,只能靠 ARQ 兜底", nacks)
 	}
 }
