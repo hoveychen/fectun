@@ -120,6 +120,11 @@ type session struct {
 	// 本身要多久:20 包/s 下攒够 k/4=5 片就要 250ms,校验片必然晚于重传请求。
 	flushMin   int
 	flushAfter time.Duration
+	// retransCopies:应对端 NACK 时同一分片发几份。默认 1(行为不变)。见 onNack。
+	retransCopies int
+	// asyncRetrans:把重传发送挪出 readLoop 的同步链。默认 false(行为不变)。
+	asyncRetrans bool
+	retransCh    chan uint32
 	// 每条 stream 独立的发送序号。接收侧按 (streamID, streamSeq) 重组,
 	// 所以这个序号必须逐 stream 连续,不能跟全局 seq 混用。
 	sendSeqOf map[uint32]uint32
@@ -185,6 +190,8 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 		s.flushMin = 2
 	}
 	s.flushAfter = groupFlushAfter
+	s.retransCopies = 1
+	s.retransCh = make(chan uint32, 1024)
 	s.myEpoch = uint32(time.Now().UnixNano())
 	if s.myEpoch == 0 {
 		s.myEpoch = 1
@@ -193,6 +200,7 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 	go s.heartbeatLoop()
 	go s.nackLoop()
 	go s.groupFlushLoop()
+	go s.retransLoop()
 	return s
 }
 

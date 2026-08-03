@@ -20,38 +20,46 @@ import (
 // TestBurstModelShape 自检 Gilbert 模型:实际丢包率和平均连续丢包长度
 // 必须落在设定值附近,否则后面整张矩阵的结论都是假的。
 func TestBurstModelShape(t *testing.T) {
-	for _, tc := range []struct{ loss, burstLen float64 }{
-		{0.10, 20}, {0.45, 30}, {0.45, 5},
+	for _, tc := range []struct {
+		loss   float64
+		badDur time.Duration
+	}{
+		{0.10, 200 * time.Millisecond},
+		{0.45, 200 * time.Millisecond},
+		{0.45, 50 * time.Millisecond},
 	} {
 		p := &lossyProxy{rnd: rand.New(rand.NewSource(42))}
-		p.setBurst(tc.loss, tc.burstLen)
+		p.setBurst(tc.loss, tc.badDur)
 
-		const n = 200000
-		dropped, runs, curRun := 0, 0, 0
-		for i := 0; i < n; i++ {
-			if p.burstDrop("src") {
-				dropped++
-				curRun++
-			} else {
-				if curRun > 0 {
+		// 以固定步长扫过一段虚拟时间,统计落在坏态里的比例与坏态平均长度。
+		// 步长取 1ms:远小于 badDur,不会把整段坏态跳过去。
+		const step = time.Millisecond
+		// 必须短于 buildTimeline 铺的 150s —— 超出末尾后 badAt 只会一直返回
+		// 最后一段的状态,统计立刻失真(第一版写 600s,实测坏态"平均"1.46s)。
+		const span = 120 * time.Second
+		base := time.Unix(0, 0)
+		badTicks, runs := 0, 0
+		wasBad := false
+		for el := time.Duration(0); el < span; el += step {
+			bad := p.burstDrop("src", base.Add(el))
+			if bad {
+				badTicks++
+				if !wasBad {
 					runs++
 				}
-				curRun = 0
 			}
+			wasBad = bad
 		}
-		if curRun > 0 {
-			runs++
-		}
-		gotLoss := float64(dropped) / n
-		gotBurst := float64(dropped) / float64(runs)
-		t.Logf("目标 loss=%.2f burst=%.0f → 实测 loss=%.3f burst=%.1f",
-			tc.loss, tc.burstLen, gotLoss, gotBurst)
+		gotLoss := float64(badTicks) / float64(span/step)
+		gotBad := time.Duration(float64(badTicks) / float64(runs) * float64(step))
+		t.Logf("目标 loss=%.2f badDur=%v → 实测 loss=%.3f badDur=%v",
+			tc.loss, tc.badDur, gotLoss, gotBad.Round(time.Millisecond))
 
 		if gotLoss < tc.loss*0.9 || gotLoss > tc.loss*1.1 {
 			t.Errorf("丢包率偏离:目标 %.2f,实测 %.3f", tc.loss, gotLoss)
 		}
-		if gotBurst < tc.burstLen*0.85 || gotBurst > tc.burstLen*1.15 {
-			t.Errorf("平均突发长度偏离:目标 %.0f,实测 %.1f", tc.burstLen, gotBurst)
+		if gotBad < time.Duration(float64(tc.badDur)*0.85) || gotBad > time.Duration(float64(tc.badDur)*1.15) {
+			t.Errorf("坏态平均时长偏离:目标 %v,实测 %v", tc.badDur, gotBad)
 		}
 	}
 }
@@ -80,12 +88,12 @@ func (r trialResult) fecRate() float64 {
 
 // runTrial 让 a 推 nBytes 字节给 b,回报耗时与两侧计数器。
 // rate 固定 25 Mbps —— 与生产 -rate 25 一致,好让结论能直接对上线上表现。
-func runTrial(t *testing.T, k, m int, loss, burstLen float64, nBytes int, seed int64) trialResult {
+func runTrial(t *testing.T, k, m int, loss float64, badDur time.Duration, nBytes int, seed int64) trialResult {
 	t.Helper()
 	p := newLossyProxy(t, 0, seed)
 	defer p.stop()
-	if burstLen > 0 {
-		p.setBurst(loss, burstLen)
+	if badDur > 0 {
+		p.setBurst(loss, badDur)
 	} else {
 		p.mu.Lock()
 		p.lossRate = loss
@@ -128,11 +136,12 @@ func TestBurstLenSweep(t *testing.T) {
 	const nBytes = 1 << 21
 	params := []struct{ k, m int }{{20, 20}, {40, 40}, {60, 60}}
 
-	t.Logf("%-10s %-8s %8s %8s %8s %8s", "突发长度", "k/m", "吞吐MB/s", "FEC接住", "漏给ARQ", "NACK")
-	for _, bl := range []float64{5, 10, 20, 40, 60} {
+	t.Logf("%-10s %-8s %8s %8s %8s %8s", "坏态时长", "k/m", "吞吐MB/s", "FEC接住", "漏给ARQ", "NACK")
+	for _, bl := range []time.Duration{20 * time.Millisecond, 50 * time.Millisecond,
+		100 * time.Millisecond, 200 * time.Millisecond, 400 * time.Millisecond} {
 		for _, pm := range params {
 			r := runTrial(t, pm.k, pm.m, 0.44, bl, nBytes, 7)
-			t.Logf("%-10.0f %-8s %8.2f %7.0f%% %8d %8d",
+			t.Logf("%-10v %-8s %8.2f %7.0f%% %8d %8d",
 				bl, fmt.Sprintf("%d/%d", r.k, r.m), r.goodputMB, r.fecRate()*100, r.rawLost, r.nackSent)
 		}
 	}
@@ -157,7 +166,7 @@ func TestLowRateLatency(t *testing.T) {
 	t.Logf("%-8s %8s %8s %8s %8s", "k/m", "p50", "p95", "max", "丢失")
 	for _, pm := range []struct{ k, m int }{{10, 10}, {20, 20}, {40, 40}, {60, 60}} {
 		p := newLossyProxy(t, 0, 11)
-		p.setBurst(0.08, 30)
+		p.setBurst(0.08, 200*time.Millisecond)
 		a := newTestSession(t, p.port(), pm.k, pm.m, 25)
 		b := newTestSession(t, p.port(), pm.k, pm.m, 25)
 		time.Sleep(400 * time.Millisecond)
@@ -214,12 +223,12 @@ func TestFecParamRepeat(t *testing.T) {
 	const nBytes = 1 << 21
 	const reps = 5
 	scenarios := []struct {
-		name     string
-		loss     float64
-		burstLen float64
+		name   string
+		loss   float64
+		badDur time.Duration
 	}{
-		{"日常-突发8%x30", 0.08, 30},
-		{"灾难-突发44%x30", 0.44, 30},
+		{"日常-突发8%/200ms", 0.08, 200 * time.Millisecond},
+		{"灾难-突发44%/200ms", 0.44, 200 * time.Millisecond},
 	}
 	params := []struct{ k, m int }{{20, 20}, {40, 40}}
 
@@ -230,7 +239,7 @@ func TestFecParamRepeat(t *testing.T) {
 			var sumTP, worstTP, sumFec, sumNack float64
 			worstTP = 1e9
 			for i := 0; i < reps; i++ {
-				r := runTrial(t, pm.k, pm.m, sc.loss, sc.burstLen, nBytes, int64(100+i*17))
+				r := runTrial(t, pm.k, pm.m, sc.loss, sc.badDur, nBytes, int64(100+i*17))
 				sumTP += r.goodputMB
 				if r.goodputMB < worstTP {
 					worstTP = r.goodputMB
@@ -342,6 +351,112 @@ func TestFlushThreshold(t *testing.T) {
 	}
 }
 
+// TestRedundantRetrans 测冗余重传:交互延迟的秒级长尾来自 ARQ 多轮往返,
+// 而不是 FEC 参数 —— 参数矩阵已经证明 20/20 在交互场景就是最优的那档。
+//
+// 44% 丢包下,一份重传有 44% 概率再丢,再等 120ms 判定 + 一个往返;两轮没中
+// 就是 400ms 起步。发 3 份把单轮失手率压到 8.5%。交互流量本身只有 ~192 kbps,
+// 而重传只发生在丢包的那些片上,所以多发几份的带宽代价在 25 Mbps 预算里
+// 几乎看不见 —— 这正是老板"带宽不重要、通畅最重要"下该做的交换。
+func TestRedundantRetrans(t *testing.T) {
+	if testing.Short() {
+		t.Skip("评估台,-short 下跳过")
+	}
+	const reps = 5
+	t.Logf("%-10s %8s %8s %8s %8s %8s %7s", "重传份数", "p50", "p90", "p95", "p99", "占用kbps", "NACK")
+	for _, copies := range []int{1, 2, 3} {
+		var all []time.Duration
+		var sumKbps, sumNack float64
+		lost := 0
+		for rep := 0; rep < reps; rep++ {
+			c := copies
+			r := runInteractiveN(t, 20, 20, int64(11+rep*13),
+				func(s *session) { s.retransCopies = c }, 400)
+			all = append(all, r.lat...)
+			sumKbps += r.kbps
+			sumNack += float64(r.nack)
+			lost += r.lost
+		}
+		sortDur(all)
+		q := func(p int) string {
+			if len(all) == 0 {
+				return "-"
+			}
+			return all[min(len(all)*p/100, len(all)-1)].Round(time.Millisecond).String()
+		}
+		t.Logf("%-10d %8s %8s %8s %8s %8.0f %7.0f  (n=%d, 未送达 %d)",
+			copies, q(50), q(90), q(95), q(99), sumKbps/reps, sumNack/reps, len(all), lost)
+	}
+}
+
+// TestAsyncRetrans 验证"接收循环被自己的重传发送拘住"这个假设。
+//
+// 前面三个方案(大分组 / 降 flush 门槛 / 冗余重传)全是负优化,共同点都是
+// 多发包。如果瓶颈真在 onNack 同步阻塞 readLoop,那么什么都不多发、只是把
+// 重传挪到独立 goroutine,延迟就该改善 —— 这是能把假设和"多发包有害"
+// 区分开的判决性实验。
+//
+// 只需在发送侧开:本场景数据是 a→b 单向的,NACK 全打在 a 上,被拘住的也是
+// a 的 readLoop —— 而它正是负责及时收下一批 NACK 的那条循环。
+func TestAsyncRetrans(t *testing.T) {
+	if testing.Short() {
+		t.Skip("评估台,-short 下跳过")
+	}
+	const reps = 5
+	// 配对比较:同一个 seed 下同步跑一遍、异步跑一遍。整体分位数差 19% 落在
+	// 单轮波动(实测 ±18%)的边缘,分不清是真改善还是运气;逐 seed 配对能看出
+	// 方向是否一致 —— 5 个 seed 全朝同一边才算数。
+	t.Logf("--- 逐 seed 配对(p95) ---")
+	wins := 0
+	for rep := 0; rep < reps; rep++ {
+		seed := int64(11 + rep*13)
+		var p [2]time.Duration
+		for i, as := range []bool{false, true} {
+			a := as
+			r := runInteractiveN(t, 20, 20, seed, func(s *session) { s.asyncRetrans = a }, 400)
+			p[i] = r.p95
+		}
+		mark := "同步赢"
+		if p[1] < p[0] {
+			mark = "异步赢"
+			wins++
+		}
+		t.Logf("seed %3d: 同步 %8s  异步 %8s  → %s", seed,
+			p[0].Round(time.Millisecond), p[1].Round(time.Millisecond), mark)
+	}
+	t.Logf("异步在 %d/%d 个 seed 上更优", wins, reps)
+
+	t.Logf("--- 合并样本 ---")
+	t.Logf("%-12s %8s %8s %8s %8s %8s %7s", "重传路径", "p50", "p90", "p95", "p99", "占用kbps", "NACK")
+	for _, async := range []bool{false, true} {
+		var all []time.Duration
+		var sumKbps, sumNack float64
+		lost := 0
+		for rep := 0; rep < reps; rep++ {
+			as := async
+			r := runInteractiveN(t, 20, 20, int64(11+rep*13),
+				func(s *session) { s.asyncRetrans = as }, 400)
+			all = append(all, r.lat...)
+			sumKbps += r.kbps
+			sumNack += float64(r.nack)
+			lost += r.lost
+		}
+		sortDur(all)
+		q := func(p int) string {
+			if len(all) == 0 {
+				return "-"
+			}
+			return all[min(len(all)*p/100, len(all)-1)].Round(time.Millisecond).String()
+		}
+		name := "同步(现状)"
+		if async {
+			name = "异步"
+		}
+		t.Logf("%-12s %8s %8s %8s %8s %8.0f %7.0f  (n=%d, 未送达 %d)",
+			name, q(50), q(90), q(95), q(99), sumKbps/reps, sumNack/reps, len(all), lost)
+	}
+}
+
 type interactiveResult struct {
 	p50, p95, max time.Duration
 	lat           []time.Duration // 原始样本,供跨轮合并后再算分位数
@@ -400,7 +515,7 @@ func runInteractiveN(t *testing.T, k, m int, seed int64, tune func(*session), ms
 		msgSize  = 100
 	)
 	p := newLossyProxy(t, 0, seed)
-	p.setBurst(0.44, 30)
+	p.setBurst(0.44, 200*time.Millisecond)
 	a := newTestSession(t, p.port(), k, m, 25)
 	b := newTestSession(t, p.port(), k, m, 25)
 	if tune != nil {
@@ -490,21 +605,21 @@ func TestFecParamMatrix(t *testing.T) {
 		{40, 40}, // 大组 + 100% 冗余
 	}
 	scenarios := []struct {
-		name     string
-		loss     float64
-		burstLen float64
+		name   string
+		loss   float64
+		badDur time.Duration
 	}{
 		{"基线-均匀8%", 0.08, 0},
-		{"基线-突发8%x30", 0.08, 30},
+		{"基线-突发8%/200ms", 0.08, 200 * time.Millisecond},
 		{"灾难-均匀44%", 0.44, 0},
-		{"灾难-突发44%x30", 0.44, 30},
+		{"灾难-突发44%/200ms", 0.44, 200 * time.Millisecond},
 	}
 
 	for _, sc := range scenarios {
 		t.Logf("=== %s ===", sc.name)
 		t.Logf("%-8s %8s %7s %8s %8s %8s %8s", "k/m", "耗时", "完成", "吞吐MB/s", "FEC接住", "漏给ARQ", "NACK")
 		for _, pm := range params {
-			r := runTrial(t, pm.k, pm.m, sc.loss, sc.burstLen, nBytes, 7)
+			r := runTrial(t, pm.k, pm.m, sc.loss, sc.badDur, nBytes, 7)
 			t.Logf("%-8s %8s %7v %8.2f %7.0f%% %8d %8d",
 				fmt.Sprintf("%d/%d", r.k, r.m), r.elapsed.Round(10*time.Millisecond),
 				r.done, r.goodputMB, r.fecRate()*100, r.rawLost, r.nackSent)
