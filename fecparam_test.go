@@ -244,6 +244,228 @@ func TestFecParamRepeat(t *testing.T) {
 	}
 }
 
+// TestInteractiveSurvival 测的是老板真正关心的那件事:链路很烂的时候,
+// 交互式 SSH 还通不通、敲一下要等多久 —— 不是吞吐。
+//
+// 场景照着生产的交互流量捏:每 50ms 一个小包(约 20 包/s,对得上线上
+// SSH 那条隧道 100-200 包/s 的量级),链路给 44% 突发丢包,也就是 8 月 3 日
+// 19:39-19:49 那段的强度。
+//
+// 参数上特意扫了 m > k 的高冗余档:老板说带宽不重要,那 25 Mbps 的预算在
+// 交互流量下根本用不完(20 包/s × 1200 B ≈ 192 kbps),完全可以拿带宽换纠错。
+// 之前那张矩阵只比了 m == k 和 m < k,把这一整类漏了。
+func TestInteractiveSurvival(t *testing.T) {
+	if testing.Short() {
+		t.Skip("评估台,-short 下跳过")
+	}
+	params := []struct{ k, m int }{
+		{20, 20}, // 现状
+		{40, 40}, // 吞吐矩阵推荐的大组
+		{20, 40}, // 200% 冗余
+		{10, 30}, // 小组 + 300% 冗余
+		{20, 60}, // 300% 冗余
+	}
+
+	const reps = 5
+	t.Logf("%-8s %8s %8s %8s %6s %8s %7s %6s  (%d 次重复取中位)", "k/m", "p50", "p95", "max", "未送达", "占用kbps", "FEC救回", "NACK", reps)
+	for _, pm := range params {
+		var p50s, p95s, maxs []time.Duration
+		var sumKbps, sumFec, sumNack float64
+		lost := 0
+		for rep := 0; rep < reps; rep++ {
+			r := runInteractive(t, pm.k, pm.m, int64(11+rep*13), nil)
+			p50s = append(p50s, r.p50)
+			p95s = append(p95s, r.p95)
+			maxs = append(maxs, r.max)
+			sumKbps += r.kbps
+			sumFec += float64(r.fec)
+			sumNack += float64(r.nack)
+			lost += r.lost
+		}
+		sortDur(p50s)
+		sortDur(p95s)
+		sortDur(maxs)
+		t.Logf("%-8s %8s %8s %8s %6d %8.0f %7.0f %6.0f", fmt.Sprintf("%d/%d", pm.k, pm.m),
+			p50s[reps/2].Round(time.Millisecond), p95s[reps/2].Round(time.Millisecond),
+			maxs[reps/2].Round(time.Millisecond), lost,
+			sumKbps/reps, sumFec/reps, sumNack/reps)
+	}
+}
+
+// TestFlushThreshold 测低流量下把补零 flush 的门槛调低,能不能让 FEC 赶在
+// ARQ 前面。
+//
+// 现状 k=20 时 flushMin = k/4 = 5 片,而交互流量只有 20 包/s —— 攒够 5 片就要
+// 250ms,再等 flushAfter 40ms 才 flush,校验片出门时早过了对端 120ms 的 NACK
+// 判定。也就是说低流量下 FEC 结构性地永远晚于 ARQ,交互延迟只能吃 ARQ 的
+// 重传往返,而重传本身还要再丢 44%。
+func TestFlushThreshold(t *testing.T) {
+	if testing.Short() {
+		t.Skip("评估台,-short 下跳过")
+	}
+	const reps = 5
+	tunes := []struct {
+		name  string
+		min   int
+		after time.Duration
+	}{
+		{"现状 k/4+40ms", 0, 0},
+		{"min2+40ms", 2, 40 * time.Millisecond},
+		{"min2+15ms", 2, 15 * time.Millisecond},
+	}
+	for _, pm := range []struct{ k, m int }{{20, 20}, {40, 40}} {
+		t.Logf("=== k/m = %d/%d ===", pm.k, pm.m)
+		t.Logf("%-14s %8s %8s %8s %8s %7s %6s", "flush 门槛", "p50", "p95", "max", "占用kbps", "FEC救回", "NACK")
+		for _, tn := range tunes {
+			var p50s, p95s, maxs []time.Duration
+			var sumKbps, sumFec, sumNack float64
+			for rep := 0; rep < reps; rep++ {
+				var tune func(*session)
+				if tn.min > 0 {
+					tune = func(s *session) { s.flushMin = tn.min; s.flushAfter = tn.after }
+				}
+				r := runInteractive(t, pm.k, pm.m, int64(11+rep*13), tune)
+				p50s = append(p50s, r.p50)
+				p95s = append(p95s, r.p95)
+				maxs = append(maxs, r.max)
+				sumKbps += r.kbps
+				sumFec += float64(r.fec)
+				sumNack += float64(r.nack)
+			}
+			sortDur(p50s)
+			sortDur(p95s)
+			sortDur(maxs)
+			t.Logf("%-14s %8s %8s %8s %8.0f %7.0f %6.0f", tn.name,
+				p50s[reps/2].Round(time.Millisecond), p95s[reps/2].Round(time.Millisecond),
+				maxs[reps/2].Round(time.Millisecond), sumKbps/reps, sumFec/reps, sumNack/reps)
+		}
+	}
+}
+
+type interactiveResult struct {
+	p50, p95, max time.Duration
+	lat           []time.Duration // 原始样本,供跨轮合并后再算分位数
+	lost          int
+	kbps          float64
+	fec, nack     uint64
+}
+
+// TestInteractiveDecisive 是 20/20 与 40/40 在交互场景下的定论实验。
+//
+// 前两轮测出来方向互相打架(一轮 40/40 的 p95 是 20/20 的一半,另一轮反过来),
+// 原因是统计功效不够:每轮只有 120 条消息,p95 实际只由 6 个样本决定,再取
+// 5 轮中位数也救不回来。这里每轮 400 条、5 轮合并成 2000 个样本后再算分位数,
+// p95 由 100 个样本支撑。
+func TestInteractiveDecisive(t *testing.T) {
+	if testing.Short() {
+		t.Skip("评估台,-short 下跳过")
+	}
+	const reps = 5
+	t.Logf("%-8s %8s %8s %8s %8s %8s %7s %6s", "k/m", "p50", "p90", "p95", "p99", "占用kbps", "FEC救回", "NACK")
+	for _, pm := range []struct{ k, m int }{{20, 20}, {40, 40}} {
+		var all []time.Duration
+		var sumKbps, sumFec, sumNack float64
+		lost := 0
+		for rep := 0; rep < reps; rep++ {
+			r := runInteractiveN(t, pm.k, pm.m, int64(11+rep*13), nil, 400)
+			all = append(all, r.lat...)
+			sumKbps += r.kbps
+			sumFec += float64(r.fec)
+			sumNack += float64(r.nack)
+			lost += r.lost
+		}
+		sortDur(all)
+		q := func(p int) string {
+			if len(all) == 0 {
+				return "-"
+			}
+			return all[min(len(all)*p/100, len(all)-1)].Round(time.Millisecond).String()
+		}
+		t.Logf("%-8s %8s %8s %8s %8s %8.0f %7.0f %6.0f  (n=%d, 未送达 %d)",
+			fmt.Sprintf("%d/%d", pm.k, pm.m), q(50), q(90), q(95), q(99),
+			sumKbps/reps, sumFec/reps, sumNack/reps, len(all), lost)
+	}
+}
+
+// runInteractive 跑一轮交互式小包场景,回报延迟分布与代价。
+// tune 非空时用来在开跑前改发送侧的 flush 门槛。
+func runInteractive(t *testing.T, k, m int, seed int64, tune func(*session)) interactiveResult {
+	return runInteractiveN(t, k, m, seed, tune, 120)
+}
+
+func runInteractiveN(t *testing.T, k, m int, seed int64, tune func(*session), msgs int) interactiveResult {
+	t.Helper()
+	const (
+		interval = 50 * time.Millisecond
+		msgSize  = 100
+	)
+	p := newLossyProxy(t, 0, seed)
+	p.setBurst(0.44, 30)
+	a := newTestSession(t, p.port(), k, m, 25)
+	b := newTestSession(t, p.port(), k, m, 25)
+	if tune != nil {
+		tune(a)
+	}
+	time.Sleep(400 * time.Millisecond)
+	p.mu.Lock()
+	p.seen = 0 // 不计握手期的心跳
+	p.mu.Unlock()
+
+	sentAt := make([]time.Time, msgs)
+	done := make(chan []time.Duration, 1)
+	go func() {
+		var lat []time.Duration
+		for len(lat) < msgs {
+			select {
+			case <-b.deliver:
+				lat = append(lat, time.Since(sentAt[len(lat)]))
+			case <-time.After(15 * time.Second):
+				done <- lat
+				return
+			}
+		}
+		done <- lat
+	}()
+	start := time.Now()
+	for i := 0; i < msgs; i++ {
+		sentAt[i] = time.Now()
+		a.writeStream(1, payload(msgSize))
+		time.Sleep(interval)
+	}
+	lat := <-done
+	wall := time.Since(start).Seconds()
+	p.mu.Lock()
+	pkts := p.seen
+	p.mu.Unlock()
+	b.stats.Lock()
+	fec, nack := b.stats.fecRecovered, b.stats.nackSent
+	b.stats.Unlock()
+	a.close()
+	b.close()
+	p.stop()
+
+	r := interactiveResult{
+		lost: msgs - len(lat), fec: fec, nack: nack,
+		kbps: float64(pkts) * float64(hdrSize+shardPayload) * 8 / wall / 1000,
+	}
+	if len(lat) == 0 {
+		return r
+	}
+	r.lat = append([]time.Duration(nil), lat...)
+	sortDur(lat)
+	r.p50 = lat[len(lat)*50/100]
+	r.p95 = lat[min(len(lat)*95/100, len(lat)-1)]
+	r.max = lat[len(lat)-1]
+	return r
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
 func sortDur(d []time.Duration) {
 	for i := 1; i < len(d); i++ {
 		for j := i; j > 0 && d[j] < d[j-1]; j-- {

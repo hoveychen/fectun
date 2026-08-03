@@ -43,6 +43,11 @@ type lossyProxy struct {
 	burstOn  bool
 	pGB, pBG float64         // good→bad / bad→good 的逐包转移概率
 	inBad    map[string]bool // 源地址 → 该方向此刻是否处于 bad 态
+
+	// seen 是流过 proxy 的包总数(不论是否被丢)。高冗余配置在低流量下会把
+	// 发包量放大十几倍,这个数用来确认放大后仍在带宽预算内 —— 否则"用带宽
+	// 换可靠性"就成了空头支票。
+	seen int
 }
 
 // setBurst 按"平均丢包率 loss、平均连续丢包长度 burstLen(单位:包)"配置 Gilbert 模型。
@@ -97,6 +102,7 @@ func (p *lossyProxy) run() {
 			return
 		}
 		p.mu.Lock()
+		p.seen++
 		known := false
 		for _, a := range p.addrs {
 			if a.String() == src.String() {
