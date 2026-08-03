@@ -31,6 +31,48 @@ type lossyProxy struct {
 	dropEnabled      bool
 	dropTimes        int
 	dropCount        map[string]int
+
+	// 突发丢包(Gilbert 模型):链路在 good/bad 两态间跳转,bad 态整段全丢。
+	// lossRate 那个独立同分布模型丢不出真实链路的成组丢包 —— 而 RS 组是
+	// 连续 k+m 个 seq、中间不交织,所以"丢 40% 但均匀散开"和"丢 40% 但
+	// 集中在一段"对 FEC 是两回事:前者每组丢 ~16 片(<m,能救),后者整组
+	// 一次丢光(>m,救不回)。要评估 k/m 就必须能造出后者。
+	//
+	// 每个方向一条独立的链:真实链路两个方向的拥塞不同步,共用一条状态
+	// 会让"去程丢的同时回程也丢"变成必然,把 ARQ 的表现压得比实际更差。
+	burstOn  bool
+	pGB, pBG float64         // good→bad / bad→good 的逐包转移概率
+	inBad    map[string]bool // 源地址 → 该方向此刻是否处于 bad 态
+}
+
+// setBurst 按"平均丢包率 loss、平均连续丢包长度 burstLen(单位:包)"配置 Gilbert 模型。
+//
+// bad 态停留长度服从几何分布,期望 1/pBG,故 pBG = 1/burstLen。
+// 稳态处于 bad 的比例 pGB/(pGB+pBG) 要等于 loss,解出 pGB = loss/(burstLen*(1-loss))。
+func (p *lossyProxy) setBurst(loss, burstLen float64) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.burstOn = true
+	p.lossRate = 0 // 突发模型接管,不再叠加独立丢包
+	p.pBG = 1 / burstLen
+	p.pGB = loss / (burstLen * (1 - loss))
+	p.inBad = make(map[string]bool)
+}
+
+// burstDrop 推进 src 方向的链状态并返回这一包是否该丢。调用者必须持有 p.mu。
+func (p *lossyProxy) burstDrop(src string) bool {
+	if p.inBad[src] {
+		if p.rnd.Float64() < p.pBG {
+			p.inBad[src] = false
+			return false // 已经回到 good,本包放行
+		}
+		return true
+	}
+	if p.rnd.Float64() < p.pGB {
+		p.inBad[src] = true
+		return true
+	}
+	return false
 }
 
 func newLossyProxy(t *testing.T, loss float64, seed int64) *lossyProxy {
@@ -72,6 +114,9 @@ func (p *lossyProxy) run() {
 			}
 		}
 		drop := p.rnd.Float64() < p.lossRate
+		if p.burstOn {
+			drop = p.burstDrop(src.String())
+		}
 		if p.dropEnabled {
 			if h, ok := parseHeader(buf[:n]); ok && h.typ == pktData {
 				// 校验片没有 seq,用 group 推算其覆盖范围的首个 seq
