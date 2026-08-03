@@ -347,8 +347,36 @@ func (s *session) nackLoop() {
 	}
 }
 
-// 对端请求重传
+// 对端请求重传。
+//
+// 默认路径是同步发 —— 而 onNack 是在 readLoop → onPacket 的同步调用链上,
+// sendRetrans 里的 acquire 会为等令牌睡眠。NACK 风暴时(生产 2026-08-03 实测
+// 500 个/秒)接收循环就被自己的重传发送反复拘住,收包处理跟着变慢,超时的
+// 缺口更多,对端 NACK 更凶 —— 一个自激回路。asyncRetrans 把发送挪出这条链,
+// 用来验证这个假设。
 func (s *session) onNack(seq uint32) {
+	if s.asyncRetrans {
+		select {
+		case s.retransCh <- seq:
+		default: // 队列满就丢,对端超时后会再 NACK
+		}
+		return
+	}
+	s.sendRetrans(seq)
+}
+
+func (s *session) retransLoop() {
+	for {
+		select {
+		case <-s.closed:
+			return
+		case seq := <-s.retransCh:
+			s.sendRetrans(seq)
+		}
+	}
+}
+
+func (s *session) sendRetrans(seq uint32) {
 	s.sendMu.Lock()
 	shard := s.sendBuf[seq]
 	s.sendMu.Unlock()
@@ -359,10 +387,19 @@ func (s *session) onNack(seq uint32) {
 	header{typ: pktData, shardIdx: byte(seq % uint32(s.k)), k: byte(s.k), m: byte(s.m),
 		group: seq / uint32(s.k), seq: seq}.marshal(pkt)
 	copy(pkt[hdrSize:], shard)
-	s.acquire(len(pkt))
-	s.conn.WriteToUDP(pkt, s.peer)
+	// 重传发 retransCopies 份:44% 丢包下单份重传自己还有 44% 概率再丢,
+	// 于是又要等一个 120ms 判定加一个往返,交互延迟就是这么被堆到秒级的。
+	// 发 3 份把"这一轮又白跑"的概率从 44% 压到 8.5%。默认 1 份,行为不变。
+	n := s.retransCopies
+	if n < 1 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		s.acquire(len(pkt))
+		s.conn.WriteToUDP(pkt, s.peer)
+	}
 	s.stats.Lock()
-	s.stats.retransSent++
+	s.stats.retransSent += uint64(n)
 	s.stats.Unlock()
 }
 

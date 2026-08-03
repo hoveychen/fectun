@@ -113,6 +113,18 @@ type session struct {
 	sendBufBytes  int
 	sendBufTail   uint32
 	sendBufBudget int
+	// flushMin / flushAfter 是补零 flush 的两个门槛,提成字段只为可调可测
+	// (默认值仍是 groupFlushMinDiv / groupFlushAfter,行为不变)。
+	// 低流量下这两个值决定 FEC 校验片能不能赶在 NACK 的 120ms 判定之前发出去 ——
+	// 而 groupFlushAfter 的注释只算了"等待 40ms",漏算了"先攒够 flushMin 片"
+	// 本身要多久:20 包/s 下攒够 k/4=5 片就要 250ms,校验片必然晚于重传请求。
+	flushMin   int
+	flushAfter time.Duration
+	// retransCopies:应对端 NACK 时同一分片发几份。默认 1(行为不变)。见 onNack。
+	retransCopies int
+	// asyncRetrans:把重传发送挪出 readLoop 的同步链。默认 false(行为不变)。
+	asyncRetrans bool
+	retransCh    chan uint32
 	// 每条 stream 独立的发送序号。接收侧按 (streamID, streamSeq) 重组,
 	// 所以这个序号必须逐 stream 连续,不能跟全局 seq 混用。
 	sendSeqOf map[uint32]uint32
@@ -173,6 +185,13 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 		lastFill:  time.Now(),
 	}
 	s.sendBufBudget = sendBufBudgetFor(s.rateBps)
+	s.flushMin = k / groupFlushMinDiv
+	if s.flushMin < 2 {
+		s.flushMin = 2
+	}
+	s.flushAfter = groupFlushAfter
+	s.retransCopies = 1
+	s.retransCh = make(chan uint32, 1024)
 	s.myEpoch = uint32(time.Now().UnixNano())
 	if s.myEpoch == 0 {
 		s.myEpoch = 1
@@ -181,6 +200,7 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 	go s.heartbeatLoop()
 	go s.nackLoop()
 	go s.groupFlushLoop()
+	go s.retransLoop()
 	return s
 }
 
@@ -272,14 +292,10 @@ func (s *session) groupFlushLoop() {
 // expected 就此卡死。补零片让 seq 保持连续,接收侧一行都不用改;
 // 零片的载荷 dataLen=0,acceptShardLocked 那边自然不会交付任何字节。
 func (s *session) flushStaleGroup() {
-	min := s.k / groupFlushMinDiv
-	if min < 2 {
-		min = 2
-	}
 	for {
 		s.sendMu.Lock()
 		n := len(s.curGroup)
-		stale := n >= min && n < s.k && time.Since(s.curGroupAt) >= groupFlushAfter
+		stale := n >= s.flushMin && n < s.k && time.Since(s.curGroupAt) >= s.flushAfter
 		s.sendMu.Unlock()
 		if !stale {
 			return

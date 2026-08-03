@@ -31,6 +31,100 @@ type lossyProxy struct {
 	dropEnabled      bool
 	dropTimes        int
 	dropCount        map[string]int
+
+	// 突发丢包(Gilbert 模型):链路在 good/bad 两态间跳转,bad 态整段全丢。
+	// lossRate 那个独立同分布模型丢不出真实链路的成组丢包 —— 而 RS 组是
+	// 连续 k+m 个 seq、中间不交织,所以"丢 40% 但均匀散开"和"丢 40% 但
+	// 集中在一段"对 FEC 是两回事:前者每组丢 ~16 片(<m,能救),后者整组
+	// 一次丢光(>m,救不回)。要评估 k/m 就必须能造出后者。
+	//
+	// 每个方向一条独立的链:真实链路两个方向的拥塞不同步,共用一条状态
+	// 会让"去程丢的同时回程也丢"变成必然,把 ARQ 的表现压得比实际更差。
+	// 突发丢包按**时间**推进,不是按包。
+	//
+	// 最初写成逐包转移,结果是发包多的配置(补零 flush、冗余重传、大分组)会让
+	// 链路状态切换得更快 —— 各个配置面对的根本不是同一条链路,配对实验因此
+	// 自相矛盾:同一组 seed 下逐 seed 比较说 A 赢 5:0,合并样本却说 B 赢。
+	// 真实链路的好坏是时间的函数,与我们发多少包无关,所以状态机也必须按时间走。
+	burstOn        bool
+	goodDur, badDur time.Duration        // good / bad 两态的平均持续时长
+	chain          map[string]*geState // 源地址 → 该方向的链路状态
+
+	// seen 是流过 proxy 的包总数(不论是否被丢)。高冗余配置在低流量下会把
+	// 发包量放大十几倍,这个数用来确认放大后仍在带宽预算内 —— 否则"用带宽
+	// 换可靠性"就成了空头支票。
+	seen int
+}
+
+// geState 是单个方向的链路时间线:一串预生成的好/坏交替时段。
+//
+// 预生成而不是边跑边抽,是为了让链路行为**完全独立于我们发了多少包**。
+// 边跑边抽的话,抽签次数取决于包的到达时刻,而不同配置(补零多寡、重传多寡)
+// 的发包时刻不同,于是同一个 seed 在不同配置下会长出不同的链路 —— 那就不是
+// 受控实验了,配对比较会自相矛盾。
+type geState struct {
+	start time.Time
+	flips []time.Duration // 第 i 次状态翻转的相对时刻,起始为 good
+}
+
+// badAt 回答 now 这一刻链路是否处于坏态。
+// 段号为奇数即坏态(第 0 段是 good)。
+func (g *geState) badAt(now time.Time) bool {
+	el := now.Sub(g.start)
+	lo, hi := 0, len(g.flips)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if g.flips[mid] <= el {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo%2 == 1
+}
+
+// setBurst 按"平均丢包率 loss、平均一次坏态持续 badDur"配置模型。
+//
+// 稳态 bad 占比 badDur/(badDur+goodDur) 要等于 loss,解出 goodDur。
+// 生产上一次突发丢 ~30 个包、当时约 150 包/s,合到时间尺度就是 200ms 量级。
+func (p *lossyProxy) setBurst(loss float64, badDur time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.burstOn = true
+	p.lossRate = 0 // 突发模型接管,不再叠加独立丢包
+	p.badDur = badDur
+	p.goodDur = time.Duration(float64(badDur) * (1 - loss) / loss)
+	p.chain = make(map[string]*geState)
+}
+
+// burstDrop 回答 src 方向的这一包是否落在坏态里。调用者必须持有 p.mu。
+// 首次见到某个方向时为它铺一条时间线,起点就是该方向第一个包的时刻。
+func (p *lossyProxy) burstDrop(src string, now time.Time) bool {
+	st := p.chain[src]
+	if st == nil {
+		st = p.buildTimeline(now)
+		p.chain[src] = st
+	}
+	return st.badAt(now)
+}
+
+// buildTimeline 预生成一条好/坏交替的时间线,长度够覆盖最长的一轮试验。
+// 每段时长取指数分布(无记忆性),均值按 good/bad 分别取。
+func (p *lossyProxy) buildTimeline(start time.Time) *geState {
+	const span = 150 * time.Second
+	g := &geState{start: start}
+	var at time.Duration
+	bad := false
+	for at < span {
+		mean := p.goodDur
+		if bad {
+			mean = p.badDur
+		}
+		at += time.Duration(p.rnd.ExpFloat64() * float64(mean))
+		g.flips = append(g.flips, at)
+		bad = !bad
+	}
+	return g
 }
 
 func newLossyProxy(t *testing.T, loss float64, seed int64) *lossyProxy {
@@ -55,6 +149,7 @@ func (p *lossyProxy) run() {
 			return
 		}
 		p.mu.Lock()
+		p.seen++
 		known := false
 		for _, a := range p.addrs {
 			if a.String() == src.String() {
@@ -72,6 +167,9 @@ func (p *lossyProxy) run() {
 			}
 		}
 		drop := p.rnd.Float64() < p.lossRate
+		if p.burstOn {
+			drop = p.burstDrop(src.String(), time.Now())
+		}
 		if p.dropEnabled {
 			if h, ok := parseHeader(buf[:n]); ok && h.typ == pktData {
 				// 校验片没有 seq,用 group 推算其覆盖范围的首个 seq
