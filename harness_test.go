@@ -10,6 +10,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/klauspost/reedsolomon"
 )
 
 // lossyProxy 在两端之间转发 UDP,并按给定概率丢包。
@@ -1069,5 +1071,152 @@ func TestExpectedAdvancesPastUnfillableHole(t *testing.T) {
 	// 反向保险:修复不能是"干脆不收包了"。
 	if n := atomic.LoadInt64(&delivered); n == 0 {
 		t.Errorf("一个字节都没交付,空洞之后的分片本该照常送达")
+	}
+}
+
+// shardPktFrom 把一个**已经编好码**的分片包成 UDP 包。
+// 与 dataShardPkt 的区别是载荷由调用方给 —— 只有送进去的校验片是真的,
+// Reconstruct 重构出来的数据片才是原样。喂假校验片的话重构结果是垃圾,
+// parseShard 会解出随机的 streamID,污染 streamRecv 把测量搅浑。
+func shardPktFrom(group uint32, idx, k, m int, epoch uint32, shard []byte) []byte {
+	pkt := make([]byte, hdrSize+shardPayload)
+	seq := group*uint32(k) + uint32(idx)
+	header{typ: pktData, shardIdx: byte(idx), k: byte(k), m: byte(m),
+		group: group, seq: seq, epoch: epoch}.marshal(pkt)
+	copy(pkt[hdrSize:], shard)
+	return pkt
+}
+
+// 回归:持续的 FEC 恢复不得留下常驻内存。
+//
+// reedsolomon 的逆矩阵缓存(inversionTree)按"本组缺了哪几片"的索引组合做 key
+// 缓存求好的逆矩阵,**只插不删、没有任何容量上限**。它是为 RAID 设计的 ——
+// 那里坏的是固定那几块盘,key 反复命中;而跨境链路每组丢的是随机的几片,
+// C(k+m, d) 的模式空间近乎无穷,命中率约等于零。于是每恢复一组就永久多占
+// 一份内存:每个树节点带 k+m 个 children 指针,叶子再挂一个 k×k 的矩阵。
+//
+// 2026-08-24 生产实测(入口侧 own-api-sz,k/m=40/40):9 天累计 FEC 恢复 235340
+// 次,RSS 从 2.4 MB 涨到 214 MB(峰值 334 MB),合每次恢复约 900 B。同期 stream
+// 新建/关闭 51673:51673 完全配对、对端 0 重启、待补峰值 32 —— fectun 自己那套
+// 记账全在界内,内存不在本仓库的代码里,而在这个库的缓存里。机器总内存 894 MB
+// 且无 swap,这一项就吃掉四分之一,且 MemoryMax=infinity 时会直接引来 OOM killer。
+//
+// k/m 从 20/20 调到 40/40 让每次恢复的代价从 950 B 涨到 3336 B(微基准实测):
+// 矩阵 400 B → 1600 B,children 40 个指针 → 80 个。
+func TestFECRecoveryMemoryIsBounded(t *testing.T) {
+	// 生产参数
+	const k, m = 40, 40
+	// 每组丢 nMissing 片数据片,丢的位置逐组不同 —— 这正是真实链路的样子,
+	// 也正是逆矩阵缓存永远命中不了的原因。
+	const nMissing = 8
+	const warmup = 200
+	const measured = 2000
+
+	enc, err := reedsolomon.New(k, m)
+	if err != nil {
+		t.Fatalf("new encoder: %v", err)
+	}
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, k, m, 1e6)
+	defer s.close()
+
+	// 消费 deliver,否则交付会在 channel 满时阻塞
+	go func() {
+		for {
+			select {
+			case <-s.deliver:
+			case <-s.closed:
+				return
+			}
+		}
+	}()
+
+	// feed 造一组真实编码过的分片,只投递其中 k 片(缺 nMissing 个数据片、
+	// 补等量校验片),迫使接收侧走一次 Reconstruct。
+	feed := func(g uint32) {
+		shards := make([][]byte, k+m)
+		for i := 0; i < k; i++ {
+			sh := make([]byte, shardPayload)
+			marshalShard(sh, 1, g*uint32(k)+uint32(i), []byte{1, 2, 3, 4, 5, 6, 7, 8})
+			shards[i] = sh
+		}
+		for i := k; i < k+m; i++ {
+			shards[i] = make([]byte, shardPayload)
+		}
+		if err := enc.Encode(shards); err != nil {
+			t.Fatalf("encode group %d: %v", g, err)
+		}
+		// 每组一个不同的丢包模式:C(40,8) 有 7600 万种,2000 组几乎不会撞
+		miss := rand.New(rand.NewSource(int64(g) + 1)).Perm(k)[:nMissing]
+		gone := make(map[int]bool, nMissing)
+		for _, i := range miss {
+			gone[i] = true
+		}
+		for i := 0; i < k; i++ {
+			if !gone[i] {
+				s.onPacket(shardPktFrom(g, i, k, m, 1, shards[i]))
+			}
+		}
+		// 补上等量校验片,凑够 k 片才够重构
+		for i := k; i < k+nMissing; i++ {
+			s.onPacket(shardPktFrom(g, i, k, m, 1, shards[i]))
+		}
+	}
+
+	// 先热身,把一次性开销(编码表、map 初始桶、goroutine 栈)排除在测量之外
+	for g := uint32(0); g < warmup; g++ {
+		feed(g)
+	}
+	runtime.GC()
+	runtime.GC()
+	var before runtime.MemStats
+	runtime.ReadMemStats(&before)
+
+	for g := uint32(warmup); g < warmup+measured; g++ {
+		feed(g)
+	}
+	runtime.GC()
+	runtime.GC()
+	var after runtime.MemStats
+	runtime.ReadMemStats(&after)
+
+	s.stats.Lock()
+	recovered := s.stats.fecRecovered
+	s.stats.Unlock()
+	s.recvMu.Lock()
+	expected, groups, gdone, nstream := s.expected, len(s.groups), len(s.groupDone), len(s.streamRecv)
+	s.recvMu.Unlock()
+
+	// 前置条件:恢复必须真的发生过,否则这个测试什么都没测
+	wantRecovered := uint64((warmup + measured) * nMissing)
+	if recovered != wantRecovered {
+		t.Fatalf("前置条件不成立:FEC 恢复 %d 次,应为 %d —— 重构没走到,测试无效", recovered, wantRecovered)
+	}
+	if expected != (warmup+measured)*k {
+		t.Fatalf("前置条件不成立:expected=%d,应为 %d —— 数据没被正常交付,测试无效",
+			expected, (warmup+measured)*k)
+	}
+	// 前置条件:fectun 自己那几个记账 map 必须是平的,否则涨的是它们、不是缓存
+	if groups > 512 || gdone > 512 || nstream > 4 {
+		t.Fatalf("前置条件不成立:groups=%d groupDone=%d streamRecv=%d 自身记账已失界,测量不可归因",
+			groups, gdone, nstream)
+	}
+
+	grown := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	perRecovery := float64(grown) / float64(measured)
+	t.Logf("%d 组恢复后常驻堆增量 %.1f MB,合每组 %.0f B(HeapAlloc %.1f → %.1f MB,存活对象 %d → %d)",
+		measured, float64(grown)/1e6, perRecovery,
+		float64(before.HeapAlloc)/1e6, float64(after.HeapAlloc)/1e6,
+		before.HeapObjects, after.HeapObjects)
+
+	// 恢复一组之后不该留下任何按组累积的常驻内存。留 256 B 的余量给测量噪声 ——
+	// 生产上这一项是 900 B/组,微基准在同参数下是 3336 B/组,余量足够宽。
+	if perRecovery > 256 {
+		t.Fatalf("FEC 恢复留下常驻内存:每组 %.0f B,%d 组共 %.1f MB 且随恢复次数线性增长 —— "+
+			"照生产上 9 天 23.5 万次恢复的量级,这就是 200 MB 常驻",
+			perRecovery, measured, float64(grown)/1e6)
 	}
 }

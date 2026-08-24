@@ -169,7 +169,21 @@ type session struct {
 }
 
 func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64) *session {
-	enc, _ := reedsolomon.New(k, m)
+	// 必须关掉逆矩阵缓存 —— 它是 reedsolomon 里唯一一处只插不删、没有容量上限的
+	// 结构。缓存按"本组缺了哪几片"的索引组合做 key 存求好的逆矩阵:每个树节点带
+	// k+m 个 children 指针,叶子再挂一个 k×k 矩阵。这在 RAID 场景是划算的(坏的是
+	// 固定那几块盘,key 反复命中),但跨境链路每组丢的是随机的几片,C(k+m,d) 的
+	// 模式空间近乎无穷,命中率约等于零 —— 纯付内存不换任何东西。
+	//
+	// 2026-08-24 生产实测(入口侧 own-api-sz,k/m=40/40):9 天累计 FEC 恢复 235340
+	// 次,RSS 从 2.4 MB 涨到 214 MB(峰值 334 MB),合每次约 900 B,占了 894 MB 机器
+	// 的四分之一且无 swap 兜底。同期 stream 新建/关闭 51673:51673 完全配对、对端
+	// 0 重启、待补峰值 32,本仓库自己那套记账全在界内 —— 内存全在这个缓存里。
+	//
+	// 代价是每次重构都要重求一次逆矩阵。微基准(k/m=40/40,每组丢 8 片,20000 次)
+	// 实测无可测代价:开缓存 45.8/55.3/59.7 µs、关缓存 53.6/49.4/40.4 µs,区间重叠 ——
+	// 不断膨胀的缓存树给 GC 的压力抵掉了省下的那次求逆。
+	enc, _ := reedsolomon.New(k, m, reedsolomon.WithInversionCache(false))
 	s := &session{
 		conn: conn, peer: peer, k: k, m: m, enc: enc,
 		sendBuf:    make(map[uint32][]byte),
