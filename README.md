@@ -28,6 +28,32 @@ ssh -p 4422 user@<入口侧IP>      # 实际登录的是落地侧
 
 两端**必须使用同一 UDP 端口**(默认 55700),这是打洞所需 —— 见下文「心跳与 conntrack」。
 
+### 多对端模式(客户端在 NAT 后面、IP 会变)
+
+落地侧不给 `-peer`,就按 UDP 源地址为每个客户端各建一个会话。客户端用 `-lport -1` 走临时端口:
+
+```bash
+# 落地侧:安全组必须放行入站 UDP 55700(没法打洞,事先不知道对端是谁)
+FECTUN_KEY=<密钥> fectun -mode server -target 127.0.0.1:22 -uport 55700 -rate 25
+
+# 客户端
+FECTUN_KEY=<密钥> fectun -mode client -listen 127.0.0.1:4422 -peer <落地侧IP> -uport 55700 -lport -1
+```
+
+- k/m 由各客户端自己的 `-k/-m` 决定(会话按客户端首包建立),落地侧的 `-k/-m` 在这个模式下不起作用;`-rate` 是每个会话的发送限速,N 个客户端同时满载时总发送量是 N×rate。
+- 对端 30 秒没有任何包(心跳 100ms 一个)就回收会话;同时最多 64 个会话。
+- 客户端换网后源地址变了,落地侧会当成新对端建新会话,原有连接断开由上层重连。
+- **公网上务必配密钥**:不配的话任何人都能经它向 `-target` 开连接。
+
+### 作为库嵌入
+
+```go
+cli, _ := fectun.Dial("<落地侧IP>:55700", fectun.Options{K: 20, M: 15, RateMbps: 25, Key: key})
+conn := cli.OpenStream() // net.Conn,对端 Server 为它连一次 target
+```
+
+同一对端上的多条连接应共用一个 `Client`:每个 `Client` 各自按 `RateMbps` 限速,各建一个会让总速率成倍超标。需要先对 socket 做平台处理(如 Android `VpnService.protect`)时,自己建 `*net.UDPConn` 传给 `NewClient`。
+
 ## 构建
 
 ```bash
@@ -46,9 +72,10 @@ GOOS=linux GOARCH=amd64 go build -o fectun-linux ./cmd/fectun
 | `-mode` | `client` | `client` 监听 TCP;`server` 转发到 `-target` |
 | `-listen` | `0.0.0.0:4422` | client 模式监听地址 |
 | `-target` | `127.0.0.1:22` | server 模式转发目标 |
-| `-peer` | *(必填)* | 对端 IP |
+| `-peer` | *(client 必填)* | 对端 IP。server 模式留空 = 多对端 |
 | `-uport` | `55700` | 对端 UDP 端口 |
-| `-lport` | 同 `-uport` | 本地 UDP 端口。生产环境两端同端口便于打洞;本地回环测试时需分开 |
+| `-lport` | 同 `-uport` | 本地 UDP 端口。生产环境两端同端口便于打洞;本地回环测试时需分开;`-1` = 临时端口 |
+| `-key` | *(空)* | 预共享密钥,两端必须一致;留空读环境变量 `FECTUN_KEY`。非空时每包带 8 字节 HMAC-SHA256 签名,验签失败直接丢弃;为空时线格式与旧版一致 |
 | `-k` | `20` | FEC 数据分片数 |
 | `-m` | `15` | FEC 校验分片数 |
 | `-rate` | `25` | **含冗余的线路限速(Mbps)** |
