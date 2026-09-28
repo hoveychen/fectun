@@ -112,7 +112,7 @@ type streamChunk struct {
 type streamReasm struct {
 	expected uint32            // 下一个待交付的 streamSeq
 	buf      map[uint32][]byte // 乱序先到的分片
-	since    time.Time         // 最近一次推进(或新建)的时刻,见 holeGiveUp
+	since    time.Time         // 最近一次推进、或空洞出现的时刻(取晚者),见 holeGiveUp
 
 	// 以下只供 holeGiveUp 断开时的诊断日志(diagStuckLocked)用。
 	// 缺的那一片载荷丢了、不知道它的全局 seq,但它一定落在"最后一片按序交付的

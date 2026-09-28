@@ -221,6 +221,13 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 		return nil // 这一片该 stream 已经交付过了
 	}
 	if r.buf[sseq] == nil {
+		// 积压由空变非空 = 空洞刚出现:holeGiveUp 的计时从这一刻起算。
+		// 只看"最后一次推进"的话,空闲超过 holeGiveUp 的 stream(ssh 常态)
+		// 一出空洞就在下一个 nackLoop tick 被判死,首个 NACK 都来不及发 ——
+		// 2026-09-28 线上 4422 的断开全是这样:缺 1 片、NACK 0 次。
+		if len(r.buf) == 0 && sseq != r.expected {
+			r.since = time.Now()
+		}
 		out := make([]byte, len(data))
 		copy(out, data)
 		r.buf[sseq] = out
