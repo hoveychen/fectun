@@ -1,4 +1,4 @@
-package main
+package fectun
 
 import (
 	"encoding/binary"

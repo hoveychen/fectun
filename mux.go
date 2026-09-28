@@ -1,8 +1,7 @@
-package main
+package fectun
 
 import (
 	"encoding/binary"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -240,7 +239,7 @@ func (m *muxer) dispatch(sid uint32, cmd byte, payload []byte) {
 		}
 		c, err := net.Dial("tcp", m.target)
 		if err != nil {
-			fmt.Printf("[mux] stream %d 连接 target 失败: %v\n", sid, err)
+			logf("[mux] stream %d 连接 target 失败: %v", sid, err)
 			m.sendFrame(sid, cmdClose, nil)
 			return
 		}
@@ -248,7 +247,7 @@ func (m *muxer) dispatch(sid uint32, cmd byte, payload []byte) {
 		m.mu.Lock()
 		m.streams[sid] = st
 		m.mu.Unlock()
-		fmt.Printf("[mux] stream %d 已连接 %s\n", sid, m.target)
+		logf("[mux] stream %d 已连接 %s", sid, m.target)
 		go st.pumpToTunnel()
 	case cmdData:
 		// 只入队,绝不在这里同步 Write —— 那会让 recvLoop 停摆,
@@ -462,7 +461,7 @@ func (s *stream) close(notify bool) {
 	// 序号记账可以清了。必须排在 sendFrame 之后 —— 清早了这条 cmdClose
 	// 会拿到一个重置回 0 的 streamSeq,对端排不出它相对于此前数据的顺序。
 	s.mux.sess.forgetStream(s.id)
-	fmt.Printf("[mux] stream %d 关闭\n", s.id)
+	logf("[mux] stream %d 关闭", s.id)
 }
 
 // client 侧:接受一个本地 TCP 连接,分配 stream
@@ -473,7 +472,7 @@ func (m *muxer) openStream(c net.Conn) {
 	st := newStream(m, sid, c)
 	m.streams[sid] = st
 	m.mu.Unlock()
-	fmt.Printf("[mux] stream %d 新建(来自 %s)\n", sid, c.RemoteAddr())
+	logf("[mux] stream %d 新建(来自 %s)", sid, c.RemoteAddr())
 	m.sendFrame(sid, cmdOpen, nil)
 	go st.pumpToTunnel()
 }
@@ -501,6 +500,6 @@ func (m *muxer) resetAll() {
 		st.conn.Close()
 	}
 	if len(old) > 0 {
-		fmt.Printf("[mux] 对端重启,已重置 %d 条 stream\n", len(old))
+		logf("[mux] 对端重启,已重置 %d 条 stream", len(old))
 	}
 }

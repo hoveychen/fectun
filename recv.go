@@ -1,4 +1,4 @@
-package main
+package fectun
 
 import (
 	"time"
@@ -339,7 +339,7 @@ func (s *session) nackLoop() {
 		}
 		for _, q := range want {
 			header{typ: pktNack, seq: q}.marshal(buf)
-			s.conn.WriteToUDP(buf, s.peer)
+			s.writePkt(buf)
 			s.stats.Lock()
 			s.stats.nackSent++
 			s.stats.Unlock()
@@ -396,7 +396,7 @@ func (s *session) sendRetrans(seq uint32) {
 	}
 	for i := 0; i < n; i++ {
 		s.acquire(len(pkt))
-		s.conn.WriteToUDP(pkt, s.peer)
+		s.writePkt(pkt)
 	}
 	s.stats.Lock()
 	s.stats.retransSent += uint64(n)
