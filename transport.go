@@ -164,13 +164,23 @@ type session struct {
 	stats struct {
 		sync.Mutex
 		rawRecv, rawLost, fecRecovered, nackSent, retransSent uint64
+		authFail                                              uint64
 	}
 	closed chan struct{}
 	// sharedConn:conn 由多个 session 共用(多对端 Server),close 时不能关它。
 	sharedConn bool
+	// auth 非 nil 时每个包带 HMAC 尾巴,见 packetAuth。
+	auth *packetAuth
 }
 
 func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64) *session {
+	return newSessionWith(conn, peer, k, m, rateMbps, nil, false)
+}
+
+// newSessionWith 额外指定鉴权与 socket 是否共用。这两项必须在后台协程启动前
+// 定下来 —— 心跳协程一起来就会读 auth。
+func newSessionWith(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64,
+	auth *packetAuth, sharedConn bool) *session {
 	// 必须关掉逆矩阵缓存 —— 它是 reedsolomon 里唯一一处只插不删、没有容量上限的
 	// 结构。缓存按"本组缺了哪几片"的索引组合做 key 存求好的逆矩阵:每个树节点带
 	// k+m 个 children 指针,叶子再挂一个 k×k 矩阵。这在 RAID 场景是划算的(坏的是
@@ -197,6 +207,8 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 		streamRecv: make(map[uint32]*streamReasm),
 		deliver:    make(chan streamChunk, 4096),
 		closed:    make(chan struct{}),
+		auth:       auth,
+		sharedConn: sharedConn,
 		rateBps:   rateMbps * 1e6 / 8,
 		lastFill:  time.Now(),
 	}
@@ -223,6 +235,9 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 // writePkt 是 session 唯一的发包出口。所有包都从这里出去,
 // 线格式上的统一处理(如鉴权)只需要改这一处。
 func (s *session) writePkt(b []byte) {
+	if s.auth != nil {
+		b = s.auth.seal(b)
+	}
 	s.conn.WriteToUDP(b, s.peer)
 }
 
@@ -410,6 +425,15 @@ func (s *session) readLoop() {
 		}
 		p := make([]byte, n)
 		copy(p, buf[:n])
+		if s.auth != nil {
+			var ok bool
+			if p, ok = s.auth.open(p); !ok {
+				s.stats.Lock()
+				s.stats.authFail++
+				s.stats.Unlock()
+				continue
+			}
+		}
 		s.onPacket(p)
 	}
 }
@@ -447,7 +471,12 @@ func (s *session) statsLine() string {
 
 	s.stats.Lock()
 	defer s.stats.Unlock()
-	return fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d",
+	line := fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d",
 		s.stats.rawRecv, s.stats.rawLost, s.stats.fecRecovered,
 		s.stats.nackSent, s.stats.retransSent, gap, streams)
+	// 只在启用鉴权时附加:两端密钥不一致时这一项会持续上涨,是最直接的线索
+	if s.auth != nil {
+		line += fmt.Sprintf(" 鉴权失败=%d", s.stats.authFail)
+	}
+	return line
 }

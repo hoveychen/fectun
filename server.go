@@ -35,6 +35,9 @@ type Server struct {
 	// 防止伪造源地址的包把内存和 goroutine 撑爆。
 	MaxPeers int
 
+	auth     *packetAuth
+	authFail atomic.Uint64
+
 	mu     sync.Mutex
 	peers  map[string]*serverPeer
 	closed chan struct{}
@@ -64,6 +67,7 @@ func NewServer(conn *net.UDPConn, target string, o Options) (*Server, error) {
 	o = o.withDefaults()
 	return &Server{
 		conn: conn, target: target, opts: o,
+		auth:        newPacketAuth(o.Key),
 		IdleTimeout: DefaultIdleTimeout,
 		MaxPeers:    DefaultMaxPeers,
 		peers:       make(map[string]*serverPeer),
@@ -85,12 +89,20 @@ func (s *Server) Serve() error {
 				return err
 			}
 		}
-		p := s.peerFor(src, buf[:n])
+		pkt := buf[:n]
+		// 验签必须在 peerFor 之前:没有密钥的包连会话都不能建
+		if s.auth != nil {
+			var ok bool
+			if pkt, ok = s.auth.open(pkt); !ok {
+				s.authFail.Add(1)
+				continue
+			}
+		}
+		p := s.peerFor(src, pkt)
 		if p == nil {
 			continue
 		}
-		pkt := make([]byte, n)
-		copy(pkt, buf[:n])
+		pkt = append([]byte(nil), pkt...)
 		p.last.Store(time.Now().UnixNano())
 		select {
 		case p.in <- pkt:
@@ -121,8 +133,7 @@ func (s *Server) peerFor(src *net.UDPAddr, first []byte) *serverPeer {
 		return nil
 	}
 	addr := *src
-	sess := newSession(s.conn, &addr, k, m, s.opts.RateMbps)
-	sess.sharedConn = true
+	sess := newSessionWith(s.conn, &addr, k, m, s.opts.RateMbps, s.auth, true)
 	p := &serverPeer{addr: &addr, sess: sess, in: make(chan []byte, serverPeerQueue)}
 	p.mux = newMuxer(sess, true, s.target)
 	s.peers[key] = p
@@ -192,10 +203,13 @@ func (s *Server) Stats() string {
 		lines = append(lines, fmt.Sprintf("%s %s", key, p.sess.statsLine()))
 	}
 	s.mu.Unlock()
+	sort.Strings(lines)
+	if s.auth != nil {
+		lines = append(lines, fmt.Sprintf("建会话前鉴权失败=%d", s.authFail.Load()))
+	}
 	if len(lines) == 0 {
 		return "无对端"
 	}
-	sort.Strings(lines)
 	return strings.Join(lines, "\n")
 }
 

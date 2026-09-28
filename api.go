@@ -22,9 +22,13 @@ func logf(format string, args ...any) {
 // K/M 两端必须一致:接收侧按本端的 K 解组,对不上的包直接丢弃。
 // RateMbps 是本端发送方向的线路限速(含冗余),净数据 ≈ RateMbps/(1+M/K)。
 // 不要超过链路当时的实际容量 —— 超发只会加剧丢包,实测曾把同机 SSH 挤断。
+//
+// Key 是可选的预共享密钥:非空时每个包带 HMAC 签名,验签失败的包直接丢弃
+// (见 packetAuth)。两端必须一致;为空时线格式与旧版相同。
 type Options struct {
 	K, M     int
 	RateMbps float64
+	Key      []byte
 }
 
 // 与 CLI 默认值保持一致。
@@ -74,7 +78,7 @@ func NewClient(conn *net.UDPConn, peer *net.UDPAddr, o Options) (*Client, error)
 	if err := o.validate(); err != nil {
 		return nil, err
 	}
-	s := newSession(conn, peer, o.K, o.M, o.RateMbps)
+	s := newSessionWith(conn, peer, o.K, o.M, o.RateMbps, newPacketAuth(o.Key), false)
 	go s.readLoop()
 	return &Client{sess: s, mux: newMuxer(s, false, "")}, nil
 }
@@ -150,7 +154,7 @@ func NewPeerServer(conn *net.UDPConn, peer *net.UDPAddr, target string, o Option
 	if err := o.validate(); err != nil {
 		return nil, err
 	}
-	s := newSession(conn, peer, o.K, o.M, o.RateMbps)
+	s := newSessionWith(conn, peer, o.K, o.M, o.RateMbps, newPacketAuth(o.Key), false)
 	go s.readLoop()
 	return &PeerServer{sess: s, mux: newMuxer(s, true, target)}, nil
 }
