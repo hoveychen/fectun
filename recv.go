@@ -1,6 +1,7 @@
 package fectun
 
 import (
+	"fmt"
 	"math"
 	"time"
 )
@@ -212,7 +213,8 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 	}
 	r := s.streamRecv[sid]
 	if r == nil {
-		r = &streamReasm{buf: make(map[uint32][]byte), since: time.Now()}
+		r = &streamReasm{buf: make(map[uint32][]byte), since: time.Now(),
+			bufGseq: make(map[uint32]uint32)}
 		s.streamRecv[sid] = r
 	}
 	if sseq < r.expected {
@@ -222,6 +224,7 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 		out := make([]byte, len(data))
 		copy(out, data)
 		r.buf[sseq] = out
+		r.bufGseq[sseq] = seq
 	}
 
 	// 只取该 stream 连续的部分。别的 stream 有没有空洞,与这里无关 ——
@@ -234,6 +237,8 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 			break
 		}
 		delete(r.buf, r.expected)
+		r.lastGseq = r.bufGseq[r.expected]
+		delete(r.bufGseq, r.expected)
 		r.expected++
 		advanced = true
 		if len(d) > 0 {
@@ -257,6 +262,7 @@ func (s *session) advanceExpectedLocked() {
 	for s.recvSeen[s.expected] {
 		delete(s.recvSeen, s.expected)
 		delete(s.firstSeen, s.expected)
+		delete(s.nackTries, s.expected)
 		s.expected++
 	}
 }
@@ -284,9 +290,26 @@ func (s *session) abandonStaleGapsLocked() {
 		return
 	}
 	floor := s.recvHigh - s.nackWin
+	if s.expected >= floor {
+		return
+	}
+	from, missing := s.expected, 0
 	for ; s.expected < floor; s.expected++ {
+		if !s.recvSeen[s.expected] {
+			missing++
+		}
 		delete(s.recvSeen, s.expected)
 		delete(s.firstSeen, s.expected)
+		delete(s.nackTries, s.expected)
+	}
+	if missing > 0 {
+		if len(s.abandoned) >= abandonLogMax {
+			s.abandoned = s.abandoned[1:]
+		}
+		s.abandoned = append(s.abandoned, gapRange{from, floor})
+		s.stats.Lock()
+		s.stats.abandonedSeq += uint64(missing)
+		s.stats.Unlock()
 	}
 }
 
@@ -341,6 +364,7 @@ func (s *session) nackLoop() {
 			} else if now.Sub(f) > 120*time.Millisecond {
 				want = append(want, q)
 				s.firstSeen[q] = now // 退避后可再次请求
+				s.nackTries[q]++
 			}
 		}
 		dead := s.reapStuckStreamsLocked(now)
@@ -406,11 +430,74 @@ func (s *session) reapStuckStreamsLocked(now time.Time) []uint32 {
 	var dead []uint32
 	for sid, r := range s.streamRecv {
 		if len(r.buf) > 0 && now.Sub(r.since) > holeGiveUp {
+			logf("[diag] stream %d 断开: %s", sid, s.diagStuckLocked(r, now))
 			dead = append(dead, sid)
 			delete(s.streamRecv, sid)
 		}
 	}
 	return dead
+}
+
+// diagStuckLocked 描述一条卡住的 stream 当时的状态,供查"空洞为什么补不回"。
+// 调用者必须持有 recvMu。
+//
+// 缺片的全局 seq 落在 (lastGseq, lo) 之间(lo = 积压里最小 streamSeq 那片的
+// 全局 seq)。对这段区间分三类数:低于 expected 的(已收到或已放弃,看是否与
+// 放弃记录重叠)、窗口内仍缺着的(及其被 NACK 的最多次数)、超出扫描窗口的。
+func (s *session) diagStuckLocked(r *streamReasm, now time.Time) string {
+	var minS, maxS uint32 = math.MaxUint32, 0
+	for sseq := range r.buf {
+		if sseq < minS {
+			minS = sseq
+		}
+		if sseq > maxS {
+			maxS = sseq
+		}
+	}
+	lo := r.bufGseq[minS]
+	from := r.lastGseq + 1
+	if r.expected == 0 {
+		from = 0 // 这条 stream 一片都没按序交付过
+	}
+	// 低于 expected 的不用逐个看;超出扫描窗口的只报跨度 —— 持着 recvMu,
+	// 不能在这里扫几百万个 seq。
+	var missingInWin, maxTries int
+	scanTop := s.expected + s.nackWin
+	// (不用内建 min/max:fecparam_test.go 里定义了一个 int 版的 min 把它遮住了)
+	start, end := from, lo
+	if start < s.expected {
+		start = s.expected
+	}
+	var beyondWin uint32
+	if end > scanTop {
+		if start > scanTop {
+			beyondWin = end - start
+		} else {
+			beyondWin = end - scanTop
+		}
+		end = scanTop
+	}
+	for q := start; q < end; q++ {
+		if s.recvSeen[q] {
+			continue
+		}
+		missingInWin++
+		if t := int(s.nackTries[q]); t > maxTries {
+			maxTries = t
+		}
+	}
+	abandonedHit := 0
+	for _, g := range s.abandoned {
+		if g.from < lo && g.to > from {
+			abandonedHit++
+		}
+	}
+	return fmt.Sprintf("缺sseq=%d 积压=%d片[%d..%d] 停滞=%.1fs 缺片gseq∈[%d,%d) "+
+		"窗口内仍缺=%d(最多NACK %d次) 超窗跨度=%d 与放弃区间重叠=%d段 "+
+		"全局expected=%d recvHigh=%d nackWin=%d nackBurst=%d arqRate=%.0f/s",
+		r.expected, len(r.buf), minS, maxS, now.Sub(r.since).Seconds(), from, lo,
+		missingInWin, maxTries, beyondWin, abandonedHit,
+		s.expected, s.recvHigh, s.nackWin, s.nackBurst, s.arqRate)
 }
 
 // 对端请求重传。
@@ -445,8 +532,23 @@ func (s *session) retransLoop() {
 func (s *session) sendRetrans(seq uint32) {
 	s.sendMu.Lock()
 	shard := s.sendBuf[seq]
+	tail, next := s.sendBufTail, s.nextSeq
 	s.sendMu.Unlock()
 	if shard == nil {
+		// 未命中分两种:seq < tail 是被字节预算淘汰了;seq >= next 是对端
+		// 请求了本端还没发过的 seq(序号空间对不上)。日志限 1 条/秒。
+		s.stats.Lock()
+		s.stats.retransMiss++
+		logIt := time.Since(s.stats.lastMissLog) >= time.Second
+		if logIt {
+			s.stats.lastMissLog = time.Now()
+		}
+		total := s.stats.retransMiss
+		s.stats.Unlock()
+		if logIt {
+			logf("[diag] 重传未命中 seq=%d sendBufTail=%d nextSeq=%d 落后=%d 累计=%d",
+				seq, tail, next, int64(next)-int64(seq), total)
+		}
 		return
 	}
 	pkt := make([]byte, hdrSize+shardPayload)
@@ -505,6 +607,8 @@ func (s *session) resetRecvLocked() {
 	s.groups = make(map[uint32][][]byte)
 	s.groupDone = make(map[uint32]bool)
 	s.firstSeen = make(map[uint32]time.Time)
+	s.nackTries = make(map[uint32]uint16)
+	s.abandoned = nil
 	// 对端重启后 stream 全部作废,重组队列里的残片没有下文了。
 	// 留着它们的话,新 stream 若复用了同一个 sid,残片会被当成新数据接上去。
 	s.streamRecv = make(map[uint32]*streamReasm)

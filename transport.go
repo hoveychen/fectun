@@ -113,7 +113,19 @@ type streamReasm struct {
 	expected uint32            // 下一个待交付的 streamSeq
 	buf      map[uint32][]byte // 乱序先到的分片
 	since    time.Time         // 最近一次推进(或新建)的时刻,见 holeGiveUp
+
+	// 以下只供 holeGiveUp 断开时的诊断日志(diagStuckLocked)用。
+	// 缺的那一片载荷丢了、不知道它的全局 seq,但它一定落在"最后一片按序交付的
+	// 全局 seq"与"积压里最小 streamSeq 那片的全局 seq"之间。
+	lastGseq uint32            // 最近一次按序交付的分片的全局 seq
+	bufGseq  map[uint32]uint32 // 积压分片 streamSeq -> 全局 seq
 }
+
+// gapRange 是一段被 abandonStaleGapsLocked 放弃的全局 seq 区间 [from, to)。
+type gapRange struct{ from, to uint32 }
+
+// abandonLogMax:诊断用,最多记最近这么多段被放弃的区间。
+const abandonLogMax = 64
 
 // holeGiveUp:一条 stream 有乱序积压、却这么久都没推进,就判定空洞补不回了。
 //
@@ -205,6 +217,10 @@ type session struct {
 	groups    map[uint32][][]byte // group -> 分片槽位(含校验片)
 	groupDone map[uint32]bool
 	firstSeen map[uint32]time.Time // seq 缺口首次发现时间,用于 NACK 定时
+	// nackTries 是每个缺口 seq 被 NACK 过几次,与 firstSeen 同生同灭,只供诊断。
+	nackTries map[uint32]uint16
+	// abandoned 是最近被放弃的全局 seq 区间(其中确实没收到的那部分),只供诊断。
+	abandoned []gapRange
 
 	// ARQ 随速率缩放的状态,见 updateARQScaleLocked。nackWin/nackBurst 受 recvMu
 	// 保护;arq* 只由 nackLoop 读写(同样在 recvMu 内)。
@@ -225,6 +241,10 @@ type session struct {
 		sync.Mutex
 		rawRecv, rawLost, fecRecovered, nackSent, retransSent uint64
 		authFail                                              uint64
+		// retransMiss:对端 NACK 过来、sendBuf 里却已没有那一片(被淘汰或从未有过)。
+		// abandonedSeq:abandonStaleGapsLocked 放弃掉的、确实没收到的全局 seq 数。
+		retransMiss, abandonedSeq uint64
+		lastMissLog               time.Time
 	}
 	closed chan struct{}
 	// sharedConn:conn 由多个 session 共用(多对端 Server),close 时不能关它。
@@ -264,6 +284,7 @@ func newSessionWith(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps flo
 		groups:     make(map[uint32][][]byte),
 		groupDone:  make(map[uint32]bool),
 		firstSeen:  make(map[uint32]time.Time),
+		nackTries:  make(map[uint32]uint16),
 		streamRecv: make(map[uint32]*streamReasm),
 		deliver:    make(chan streamChunk, 4096),
 		closed:    make(chan struct{}),
@@ -549,6 +570,8 @@ func (s *session) close() {
 //   重传   本端应对端请求发出的重传数
 //   待补   此刻仍在等的 seq 跨度(recvHigh-expected),持续不落零说明有洞补不上
 //   stream 当前有重组状态的 stream 数
+//   重传未命中 对端 NACK 了、本端 sendBuf 里却已没有那一片的次数
+//   放弃   因落后超出缺口窗口而放弃、确实没收到的全局 seq 数
 func (s *session) statsLine() string {
 	s.recvMu.Lock()
 	gap := s.recvHigh - s.expected
@@ -567,9 +590,10 @@ func (s *session) statsLine() string {
 
 	s.stats.Lock()
 	defer s.stats.Unlock()
-	line := fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d",
+	line := fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d 重传未命中=%d 放弃=%d",
 		s.stats.rawRecv, s.stats.rawLost, s.stats.fecRecovered,
-		s.stats.nackSent, s.stats.retransSent, gap, streams)
+		s.stats.nackSent, s.stats.retransSent, gap, streams,
+		s.stats.retransMiss, s.stats.abandonedSeq)
 	// 只在启用鉴权时附加:两端密钥不一致时这一项会持续上涨,是最直接的线索
 	if s.auth != nil {
 		line += fmt.Sprintf(" 鉴权失败=%d", s.stats.authFail)
