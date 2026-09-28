@@ -375,11 +375,12 @@ func (s *session) nackLoop() {
 			}
 		}
 		dead := s.reapStuckStreamsLocked(now)
+		onDead := s.onStreamDead // 受 recvMu 保护,见 setOnStreamDead
 		s.recvMu.Unlock()
 
-		if s.onStreamDead != nil {
+		if onDead != nil {
 			for _, sid := range dead {
-				s.onStreamDead(sid)
+				onDead(sid)
 			}
 		}
 		if newGaps > 0 {
@@ -429,6 +430,14 @@ func (s *session) updateARQScaleLocked(now time.Time) {
 func (s *session) maxNackWin() uint32 {
 	w := s.arqMaxRate * nackSpan.Seconds()
 	return uint32(math.Min(math.Max(w, nackWindow), nackWindowMax))
+}
+
+// setOnStreamDead 设置 onStreamDead。它由上层(newMuxer)在后台协程启动之后才
+// 挂上,而 nackLoop 每个 tick 都要读,所以读写都走 recvMu。
+func (s *session) setOnStreamDead(f func(sid uint32)) {
+	s.recvMu.Lock()
+	s.onStreamDead = f
+	s.recvMu.Unlock()
 }
 
 // reapStuckStreamsLocked 找出空洞补不回的 stream(有积压但超过 holeGiveUp

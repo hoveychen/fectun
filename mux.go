@@ -64,8 +64,11 @@ func streamWindowFor(rateBps float64, k, m int) uint32 {
 // 落地侧的 sshd 在 LoginGraceTime 内只是静静等待,不会回 EOF,所以对端的
 // cmdShutdown 永远不来。
 //
-// 是变量而非常量:测试要把它调短。
-var halfCloseLinger = 60 * time.Second
+// 是变量而非常量:测试要把它调短。用原子量是因为前一个测试残留的 stream 协程
+// 可能恰在此时读它(-race 实测)。存的是纳秒数。
+var halfCloseLinger atomic.Int64
+
+func init() { halfCloseLinger.Store(int64(60 * time.Second)) }
 
 // 累计消费超过窗口的一半就回一个窗口更新帧:既不会每帧都回(白占隧道带宽),
 // 又能让发送方始终有额度。
@@ -144,7 +147,7 @@ func newMuxer(s *session, isServer bool, target string) *muxer {
 	}
 	// 对端重启后序号空间已重置,旧 stream 全部失效,必须清掉
 	s.onReset = m.resetAll
-	s.onStreamDead = m.killStream
+	s.setOnStreamDead(m.killStream)
 	go m.recvLoop()
 	return m
 }
@@ -433,7 +436,7 @@ func (s *stream) pumpToTunnel() {
 // 否则对端那一侧也会挂着同样一条 stream。
 // 用 time.AfterFunc 而不是起 goroutine:定时器由 runtime 管,不额外占栈。
 func (s *stream) lingerAfterEOF() {
-	time.AfterFunc(halfCloseLinger, func() {
+	time.AfterFunc(time.Duration(halfCloseLinger.Load()), func() {
 		s.mu.Lock()
 		stuck := !s.recvEOF && !s.closed
 		s.mu.Unlock()
