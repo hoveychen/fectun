@@ -1,8 +1,7 @@
-package main
+package fectun
 
 import (
 	"encoding/binary"
-	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -241,7 +240,7 @@ func (m *muxer) dispatch(sid uint32, cmd byte, payload []byte) {
 		}
 		c, err := net.Dial("tcp", m.target)
 		if err != nil {
-			fmt.Printf("[mux] stream %d 连接 target 失败: %v\n", sid, err)
+			logf("[mux] stream %d 连接 target 失败: %v", sid, err)
 			m.sendFrame(sid, cmdClose, nil)
 			return
 		}
@@ -249,7 +248,7 @@ func (m *muxer) dispatch(sid uint32, cmd byte, payload []byte) {
 		m.mu.Lock()
 		m.streams[sid] = st
 		m.mu.Unlock()
-		fmt.Printf("[mux] stream %d 已连接 %s\n", sid, m.target)
+		logf("[mux] stream %d 已连接 %s", sid, m.target)
 		go st.pumpToTunnel()
 	case cmdData:
 		// 只入队,绝不在这里同步 Write —— 那会让 recvLoop 停摆,
@@ -463,14 +462,14 @@ func (s *stream) close(notify bool) {
 	// 序号记账可以清了。必须排在 sendFrame 之后 —— 清早了这条 cmdClose
 	// 会拿到一个重置回 0 的 streamSeq,对端排不出它相对于此前数据的顺序。
 	s.mux.sess.forgetStream(s.id)
-	fmt.Printf("[mux] stream %d 关闭\n", s.id)
+	logf("[mux] stream %d 关闭", s.id)
 }
 
 // killStream 断开一条空洞补不回的 stream(见 holeGiveUp),并通知对端一起关。
 // 不在 sess 的回调里同步做:close 会 sendFrame,而那要走发送侧的令牌桶。
 func (m *muxer) killStream(sid uint32) {
 	go func() {
-		fmt.Printf("[mux] stream %d 有补不回的空洞超过 %s,断开\n", sid, holeGiveUp)
+		logf("[mux] stream %d 有补不回的空洞超过 %s,断开", sid, holeGiveUp)
 		if st := m.lookup(sid); st != nil {
 			st.close(true)
 			return
@@ -488,7 +487,7 @@ func (m *muxer) openStream(c net.Conn) {
 	st := newStream(m, sid, c)
 	m.streams[sid] = st
 	m.mu.Unlock()
-	fmt.Printf("[mux] stream %d 新建(来自 %s)\n", sid, c.RemoteAddr())
+	logf("[mux] stream %d 新建(来自 %s)", sid, c.RemoteAddr())
 	m.sendFrame(sid, cmdOpen, nil)
 	go st.pumpToTunnel()
 }
@@ -516,6 +515,6 @@ func (m *muxer) resetAll() {
 		st.conn.Close()
 	}
 	if len(old) > 0 {
-		fmt.Printf("[mux] 对端重启,已重置 %d 条 stream\n", len(old))
+		logf("[mux] 对端重启,已重置 %d 条 stream", len(old))
 	}
 }

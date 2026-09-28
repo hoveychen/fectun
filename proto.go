@@ -4,7 +4,7 @@
 //  2. NACK-based ARQ 兜底 FEC 未能恢复的残余丢包(TCP 字节流必须完整有序)
 //  3. 内建心跳维持 NAT/安全组 conntrack —— 实测单向 UDP 会被阿里云安全组全丢
 //  4. 令牌桶速率控制 —— 实测持续满负载会把链路丢包从 10% 推到 30%,FEC 会崩
-package main
+package fectun
 
 import (
 	"encoding/binary"
