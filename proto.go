@@ -16,6 +16,7 @@ const (
 	pktHeartbeat = 3 // 维持 conntrack
 	pktOpen      = 4 // 新建 stream
 	pktClose     = 5 // 关闭 stream
+	pktFeedback  = 6 // 收端回报累计收到的 pktData 数(seq 字段),供对端拥塞控制
 
 	hdrSize   = 16
 	maxShard  = 1200 // UDP payload 上限,留足 IP/UDP 头避免分片

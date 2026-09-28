@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -130,7 +131,13 @@ type session struct {
 	sendSeqOf map[uint32]uint32
 	tokens        float64 // 令牌桶
 	lastFill      time.Time
-	rateBps       float64
+	// rateBps 是 -rate 给的上限。窗口、重传缓冲都按它算;令牌桶在开了拥塞控制
+	// 后改用 cc 给出的当前速率。
+	rateBps float64
+	cc      *congCtl // nil = 不做拥塞控制,按 rateBps 固定发(测试默认)
+
+	// 累计发出 / 收到的 pktData 数,拥塞控制靠两端这对计数算单方向丢包率。
+	txData, rxData atomic.Uint32
 
 	// ---- 接收侧 ----
 	recvMu   sync.Mutex
@@ -218,14 +225,24 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 	return s
 }
 
+// enableCC 打开拥塞控制:-rate 变成上限,实际速率在 [floorMbps, 上限] 内自动调。
+// 必须在 readLoop 启动前调用。
+func (s *session) enableCC(floorMbps float64) {
+	s.cc = newCongCtl(s.rateBps, floorMbps*1e6/8)
+}
+
 // 令牌桶:实测持续满负载会把链路丢包从 10% 推到 30%,必须限速
 func (s *session) acquire(n int) {
 	for {
 		s.sendMu.Lock()
 		now := time.Now()
-		s.tokens += s.rateBps * now.Sub(s.lastFill).Seconds()
+		rate := s.rateBps
+		if s.cc != nil {
+			rate = s.cc.rate(now)
+		}
+		s.tokens += rate * now.Sub(s.lastFill).Seconds()
 		s.lastFill = now
-		if cap := s.rateBps * 0.1; s.tokens > cap {
+		if cap := rate * 0.1; s.tokens > cap {
 			s.tokens = cap
 		}
 		if s.tokens >= float64(n) {
@@ -233,7 +250,7 @@ func (s *session) acquire(n int) {
 			s.sendMu.Unlock()
 			return
 		}
-		need := (float64(n) - s.tokens) / s.rateBps
+		need := (float64(n) - s.tokens) / rate
 		s.sendMu.Unlock()
 		time.Sleep(time.Duration(need * float64(time.Second)))
 	}
@@ -262,6 +279,11 @@ func (s *session) heartbeatLoop() {
 			header{typ: pktHeartbeat, seq: s.nextSeq, epoch: s.myEpoch}.marshal(buf)
 			s.conn.WriteToUDP(buf, s.peer)
 			s.sendMu.Unlock()
+
+			// 反馈无条件发:本端开没开拥塞控制,对端都可能要用。老版本对端不认识
+			// 这个类型,onPacket 会直接忽略。
+			header{typ: pktFeedback, seq: s.rxData.Load(), epoch: s.myEpoch}.marshal(buf)
+			s.conn.WriteToUDP(buf, s.peer)
 		}
 	}
 }
@@ -372,6 +394,7 @@ func (s *session) pushShard(shard []byte) {
 	copy(pkt[hdrSize:], shard)
 	s.acquire(len(pkt))
 	s.conn.WriteToUDP(pkt, s.peer)
+	s.txData.Add(1)
 
 	if !full {
 		return
@@ -391,6 +414,7 @@ func (s *session) pushShard(shard []byte) {
 		copy(p2[hdrSize:], shards[i])
 		s.acquire(len(p2))
 		s.conn.WriteToUDP(p2, s.peer)
+		s.txData.Add(1)
 	}
 }
 
@@ -438,9 +462,19 @@ func (s *session) statsLine() string {
 	streams := len(s.streamRecv)
 	s.recvMu.Unlock()
 
+	cc := ""
+	if s.cc != nil {
+		rate, loss, base, active := s.cc.snapshot(time.Now())
+		if active {
+			cc = fmt.Sprintf(" 速率=%.1fMbps 丢包=%.1f%% 本底=%.1f%%", rate*8/1e6, loss*100, base*100)
+		} else {
+			cc = fmt.Sprintf(" 速率=%.1fMbps(无反馈,固定上限)", rate*8/1e6)
+		}
+	}
+
 	s.stats.Lock()
 	defer s.stats.Unlock()
-	return fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d",
+	return fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d%s",
 		s.stats.rawRecv, s.stats.rawLost, s.stats.fecRecovered,
-		s.stats.nackSent, s.stats.retransSent, gap, streams)
+		s.stats.nackSent, s.stats.retransSent, gap, streams, cc)
 }

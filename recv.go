@@ -48,7 +48,13 @@ func (s *session) onPacket(b []byte) {
 	case pktNack:
 		s.onNack(h.seq)
 		return
+	case pktFeedback:
+		if s.cc != nil {
+			s.cc.onFeedback(time.Now(), s.txData.Load(), h.seq)
+		}
+		return
 	case pktData:
+		s.rxData.Add(1)
 	default:
 		return
 	}
@@ -397,6 +403,7 @@ func (s *session) sendRetrans(seq uint32) {
 	for i := 0; i < n; i++ {
 		s.acquire(len(pkt))
 		s.conn.WriteToUDP(pkt, s.peer)
+		s.txData.Add(1)
 	}
 	s.stats.Lock()
 	s.stats.retransSent += uint64(n)
