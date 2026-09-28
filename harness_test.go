@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -1218,5 +1219,132 @@ func TestFECRecoveryMemoryIsBounded(t *testing.T) {
 		t.Fatalf("FEC 恢复留下常驻内存:每组 %.0f B,%d 组共 %.1f MB 且随恢复次数线性增长 —— "+
 			"照生产上 9 天 23.5 万次恢复的量级,这就是 200 MB 常驻",
 			perRecovery, measured, float64(grown)/1e6)
+	}
+}
+
+// saturate 经 mux 用 4 条 stream 满负载写 dur,返回写入字节数、误判重置次数和首个写错误。
+//
+// 必须走 mux:直接调 writeStream 会绕过流控窗口,接收侧一有缺口重组缓冲就无界
+// 增长 —— 那个版本常驻堆 241 MB,2026-09-28 放到 894 MB 的生产机上跑直接把机器
+// 打爆重启。这些测试只在本机(或容器)里跑。
+func saturate(t *testing.T, rateMbps, ccFloorMbps, burstLoss float64, dur time.Duration) (sent int64, resets int32, werr error) {
+	t.Helper()
+	sink, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("sink listen: %v", err)
+	}
+	defer sink.Close()
+	go func() {
+		for {
+			c, err := sink.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(io.Discard, c); c.Close() }()
+		}
+	}()
+
+	px := newLossyProxy(t, 0, 91)
+	defer px.stop()
+	if burstLoss > 0 {
+		px.setBurst(burstLoss, 200*time.Millisecond)
+	}
+	cli := newTestSession(t, px.port(), 40, 40, rateMbps)
+	srv := newTestSession(t, px.port(), 40, 40, rateMbps)
+	defer cli.close()
+	defer srv.close()
+	if ccFloorMbps > 0 {
+		cli.enableCC(ccFloorMbps)
+		srv.enableCC(ccFloorMbps)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	cliMux := newMuxer(cli, false, "")
+	newMuxer(srv, true, sink.Addr().String())
+	var nReset atomic.Int32
+	for _, s := range []*session{cli, srv} {
+		orig := s.onReset
+		s.onReset = func() { nReset.Add(1); orig() }
+	}
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			cliMux.openStream(c)
+		}
+	}()
+
+	chunk := payload(64 << 10)
+	end := time.Now().Add(dur)
+	var wg sync.WaitGroup
+	var total atomic.Int64
+	var firstErr atomic.Value
+	for i := 0; i < 4; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer c.Close()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(end) && nReset.Load() == 0 {
+				c.SetWriteDeadline(time.Now().Add(8 * time.Second))
+				n, err := c.Write(chunk)
+				total.Add(int64(n))
+				if err != nil {
+					firstErr.CompareAndSwap(nil, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	t.Logf("rate=%.0f ccFloor=%.0f burst=%.0f%%: %s 写入 %d MB | cli %s", rateMbps, ccFloorMbps,
+		burstLoss*100, dur, total.Load()>>20, cli.statsLine())
+	if e, ok := firstErr.Load().(error); ok {
+		werr = e
+	}
+	return total.Load(), nReset.Load(), werr
+}
+
+// 满负载下不得误判对端重置,也不得卡死。
+//
+// 两个历史问题都在这里撞:
+//   - 心跳读完 nextSeq 放锁后才发,被数据片抢先,接收端连续 3 次看到"报低"就误判
+//     对端重置。2026-09-28 实测固定 rate=200、k=m=40 时 2~7 秒必现。
+//   - 固定 rate≥200 时突发丢包压垮 ARQ,缺片在 NACK 到达前就被挤出重传缓冲,
+//     stream 永久挂住。拥塞控制把速率压回链路(这里是 2 核接收端)承载得了的量。
+func TestSaturatedFlowDoesNotFalseReset(t *testing.T) {
+	_, resets, err := saturate(t, 200, 10, 0, 10*time.Second)
+	if resets != 0 {
+		t.Fatalf("对端没有重启,满负载 10 秒内却误判了 %d 次重置", resets)
+	}
+	if err != nil {
+		t.Fatalf("写入中途失败:%v —— 隧道卡死或 stream 被断开", err)
+	}
+}
+
+// 验收:突发丢包下,拥塞控制(上限 200)的吞吐不低于原来的固定 rate=50。
+// 丢包模型取评估台的 10%、坏态 200ms。
+func TestCCBeatsFixedRateUnderBurstLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("对照实验要跑 20 秒")
+	}
+	fixed, _, ferr := saturate(t, 50, 0, 0.1, 10*time.Second)
+	cc, resets, err := saturate(t, 200, 10, 0.1, 10*time.Second)
+	if ferr != nil {
+		t.Fatalf("固定 rate=50 的对照组就失败了:%v", ferr)
+	}
+	if err != nil || resets != 0 {
+		t.Fatalf("拥塞控制组失败:err=%v resets=%d", err, resets)
+	}
+	if float64(cc) < float64(fixed)*0.95 {
+		t.Fatalf("拥塞控制 %d MB 不如固定 rate=50 的 %d MB", cc>>20, fixed>>20)
 	}
 }
