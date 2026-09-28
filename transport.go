@@ -251,12 +251,17 @@ func (s *session) heartbeatLoop() {
 		case <-s.closed:
 			return
 		case <-t.C:
+			// seq 携带"我已发出的分片总数",对端据此判断是否有尾部丢失。
+			//
+			// 必须持 sendMu 发出:读完 nextSeq 就放锁的话,放锁到 WriteToUDP 之间
+			// 数据片能分到新 seq 并抢先发出,对端先收到数据、后收到"报低"的心跳。
+			// 满负载下连续 3 次就会被 lowHbResetStreak 当成对端重置、拆掉全部 stream
+			// —— 2026-09-28 实测 rate=200 时 2~7 秒必现。持锁期间新 seq 分配不出来,
+			// 此后的数据片只可能排在心跳之后进 socket。
 			s.sendMu.Lock()
-			next := s.nextSeq
-			s.sendMu.Unlock()
-			// seq 携带"我已发出的分片总数",对端据此判断是否有尾部丢失
-			header{typ: pktHeartbeat, seq: next, epoch: s.myEpoch}.marshal(buf)
+			header{typ: pktHeartbeat, seq: s.nextSeq, epoch: s.myEpoch}.marshal(buf)
 			s.conn.WriteToUDP(buf, s.peer)
+			s.sendMu.Unlock()
 		}
 	}
 }
