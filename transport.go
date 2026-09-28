@@ -166,6 +166,8 @@ type session struct {
 		rawRecv, rawLost, fecRecovered, nackSent, retransSent uint64
 	}
 	closed chan struct{}
+	// sharedConn:conn 由多个 session 共用(多对端 Server),close 时不能关它。
+	sharedConn bool
 }
 
 func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64) *session {
@@ -261,7 +263,9 @@ func (s *session) heartbeatLoop() {
 			next := s.nextSeq
 			s.sendMu.Unlock()
 			// seq 携带"我已发出的分片总数",对端据此判断是否有尾部丢失
-			header{typ: pktHeartbeat, seq: next, epoch: s.myEpoch}.marshal(buf)
+			// 心跳也带上本端 k/m:多对端 Server 靠对端第一个包(往往就是心跳)
+			// 决定用什么 k/m 建会话。旧版接收方不读心跳的这两个字节,线格式兼容。
+			header{typ: pktHeartbeat, k: byte(s.k), m: byte(s.m), seq: next, epoch: s.myEpoch}.marshal(buf)
 			s.writePkt(buf)
 		}
 	}
@@ -417,7 +421,9 @@ func (s *session) close() {
 	default:
 		close(s.closed)
 	}
-	s.conn.Close()
+	if !s.sharedConn {
+		s.conn.Close()
+	}
 }
 
 // statsLine 拼一行运行统计。
