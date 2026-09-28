@@ -31,10 +31,10 @@ ssh -p 4422 user@<入口侧IP>      # 实际登录的是落地侧
 ## 构建
 
 ```bash
-go build -o fectun .
+go build -o fectun ./cmd/fectun
 
 # 交叉编译到 Linux 服务器
-GOOS=linux GOARCH=amd64 go build -o fectun-linux .
+GOOS=linux GOARCH=amd64 go build -o fectun-linux ./cmd/fectun
 ```
 
 依赖仅一个:[`klauspost/reedsolomon`](https://github.com/klauspost/reedsolomon)(带 SIMD 优化的 RS 编解码;标准库无 RS 实现,手写 Galois Field 运算既不现实、性能也差)。

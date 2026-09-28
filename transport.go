@@ -1,4 +1,4 @@
-package main
+package fectun
 
 import (
 	"fmt"
@@ -218,6 +218,12 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 	return s
 }
 
+// writePkt 是 session 唯一的发包出口。所有包都从这里出去,
+// 线格式上的统一处理(如鉴权)只需要改这一处。
+func (s *session) writePkt(b []byte) {
+	s.conn.WriteToUDP(b, s.peer)
+}
+
 // 令牌桶:实测持续满负载会把链路丢包从 10% 推到 30%,必须限速
 func (s *session) acquire(n int) {
 	for {
@@ -256,7 +262,7 @@ func (s *session) heartbeatLoop() {
 			s.sendMu.Unlock()
 			// seq 携带"我已发出的分片总数",对端据此判断是否有尾部丢失
 			header{typ: pktHeartbeat, seq: next, epoch: s.myEpoch}.marshal(buf)
-			s.conn.WriteToUDP(buf, s.peer)
+			s.writePkt(buf)
 		}
 	}
 }
@@ -366,7 +372,7 @@ func (s *session) pushShard(shard []byte) {
 		group: group, seq: seq, epoch: s.myEpoch}.marshal(pkt)
 	copy(pkt[hdrSize:], shard)
 	s.acquire(len(pkt))
-	s.conn.WriteToUDP(pkt, s.peer)
+	s.writePkt(pkt)
 
 	if !full {
 		return
@@ -385,7 +391,7 @@ func (s *session) pushShard(shard []byte) {
 		header{typ: pktData, shardIdx: byte(i), k: byte(s.k), m: byte(s.m), group: group, epoch: s.myEpoch}.marshal(p2)
 		copy(p2[hdrSize:], shards[i])
 		s.acquire(len(p2))
-		s.conn.WriteToUDP(p2, s.peer)
+		s.writePkt(p2)
 	}
 }
 
