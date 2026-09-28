@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/klauspost/reedsolomon"
@@ -25,7 +26,31 @@ const groupKeepWindow = 128
 //
 // 限制窗口不损失能力:ARQ 只需要修补最近的缺口,远处的缺口等 expected 推进
 // 上来后自然进入窗口。
+//
+// 窗口不再是常量,而是随实际收包速率缩放(见 updateARQScaleLocked),这里的
+// nackWindow 只是下限。固定 4096 在 rate=200、k=m=40 下只合 0.4 秒的数据片:
+// 一次几百毫秒的突发坏态就能丢上几千片,缺口还没来得及 NACK 就被当成补不回
+// 放弃掉了,那条 stream 随后被 holeGiveUp 断开 —— 2026-09-28 本机 Docker 实测
+// 10% 突发丢包(坏态均值 200ms)必现。
 const nackWindow = 4096
+
+// nackWindowMax 是缩放后窗口的硬上限:firstSeen/recvSeen 按窗口同阶增长,
+// 65536 条约 2.6 MB,sz 那台 894 MB 的机器扛得住。
+const nackWindowMax = 65536
+
+// nackSpan:缺口窗口覆盖多长时间的数据片。要盖住一次突发坏态加上 NACK 判定、
+// 重传往返与再丢一轮的时间;再长也没用 —— 对端重传缓冲只留约 1 秒(见
+// sendBufBudgetFor),更老的缺口 NACK 了也没人应答。
+const nackSpan = 2 * time.Second
+
+// nackBurstSpan:每个 nackLoop tick 最多发出这么长时间的数据片量的 NACK。
+// 原先写死每 40ms 32 个(800/s),rate=200 时一次突发丢的 2000 片要 2.5 秒才请求
+// 得完,早就超出对端重传缓冲。取两个 tick 的量,让突发后的积压能追上。
+const nackBurstSpan = 80 * time.Millisecond
+
+// arqRateDecay:收包速率估计的衰减时间常数。估计值取"峰值保持、慢衰减"而不是
+// 普通 EWMA —— 突发坏态里收包量会掉到零,而那恰恰是最需要大窗口的时候。
+const arqRateDecay = 3 * time.Second
 
 // lowHbResetStreak:连续多少个心跳报告更低的 nextSeq,才判定对端重置了序号空间。
 //
@@ -87,7 +112,31 @@ type streamChunk struct {
 type streamReasm struct {
 	expected uint32            // 下一个待交付的 streamSeq
 	buf      map[uint32][]byte // 乱序先到的分片
+	since    time.Time         // 最近一次推进、或空洞出现的时刻(取晚者),见 holeGiveUp
+
+	// 以下只供 holeGiveUp 断开时的诊断日志(diagStuckLocked)用。
+	// 缺的那一片载荷丢了、不知道它的全局 seq,但它一定落在"最后一片按序交付的
+	// 全局 seq"与"积压里最小 streamSeq 那片的全局 seq"之间。
+	lastGseq uint32            // 最近一次按序交付的分片的全局 seq
+	bufGseq  map[uint32]uint32 // 积压分片 streamSeq -> 全局 seq
 }
+
+// gapRange 是一段被 abandonStaleGapsLocked 放弃的全局 seq 区间 [from, to)。
+type gapRange struct{ from, to uint32 }
+
+// abandonLogMax:诊断用,最多记最近这么多段被放弃的区间。
+const abandonLogMax = 64
+
+// holeGiveUp:一条 stream 有乱序积压、却这么久都没推进,就判定空洞补不回了。
+//
+// 补不回是真会发生的:突发丢包超过 ARQ 的请求速度时,缺的那片在 NACK 到达前
+// 就被对端挤出了重传缓冲,而 abandonStaleGapsLocked 也会放弃落后太多的全局缺口。
+// 此后这条 stream 永久挂住且不报错 —— 2026-09-28 本机 Docker 实测 rate≥200 必现。
+// 断开它,上层(ssh 等)才会看到连接断了并重连。
+//
+// 标注:5 秒是权衡取的,不是实测值。恶劣链路下多轮重传可能要好几秒,取太短会
+// 误杀还能恢复的连接;取太长则挂死的连接要多等。
+const holeGiveUp = 5 * time.Second
 
 type session struct {
 	conn *net.UDPConn
@@ -100,6 +149,8 @@ type session struct {
 	myEpoch   uint32
 	peerEpoch uint32
 	onReset   func() // 通知上层(mux)关闭所有 stream
+	// onStreamDead 通知上层某条 stream 的空洞补不回了,见 holeGiveUp。
+	onStreamDead func(sid uint32)
 
 	// ---- 发送侧 ----
 	sendMu   sync.Mutex
@@ -136,7 +187,13 @@ type session struct {
 	sendSeqOf map[uint32]uint32
 	tokens        float64 // 令牌桶
 	lastFill      time.Time
-	rateBps       float64
+	// rateBps 是 -rate 给的上限。窗口、重传缓冲都按它算;令牌桶在开了拥塞控制
+	// 后改用 cc 给出的当前速率。
+	rateBps float64
+	cc      *congCtl // nil = 不做拥塞控制,按 rateBps 固定发(测试默认)
+
+	// 累计发出 / 收到的 pktData 数,拥塞控制靠两端这对计数算单方向丢包率。
+	txData, rxData atomic.Uint32
 
 	// ---- 接收侧 ----
 	recvMu   sync.Mutex
@@ -160,6 +217,19 @@ type session struct {
 	groups    map[uint32][][]byte // group -> 分片槽位(含校验片)
 	groupDone map[uint32]bool
 	firstSeen map[uint32]time.Time // seq 缺口首次发现时间,用于 NACK 定时
+	// nackTries 是每个缺口 seq 被 NACK 过几次,与 firstSeen 同生同灭,只供诊断。
+	nackTries map[uint32]uint16
+	// abandoned 是最近被放弃的全局 seq 区间(其中确实没收到的那部分),只供诊断。
+	abandoned []gapRange
+
+	// ARQ 随速率缩放的状态,见 updateARQScaleLocked。nackWin/nackBurst 受 recvMu
+	// 保护;arq* 只由 nackLoop 读写(同样在 recvMu 内)。
+	nackWin     uint32  // 当前缺口窗口(seq 数)
+	nackBurst   int     // 当前每 tick 最多发的 NACK 数
+	arqRate     float64 // 数据片 seq 推进速率的估计(个/秒)
+	arqMaxRate  float64 // 本端 -rate 换算出的 seq 速率上限,估计值不超过它
+	arqLastHigh uint32
+	arqLastAt   time.Time
 
 	// streamRecv 是逐 stream 的重组缓冲。一条 stream 的空洞只挡它自己,
 	// 别的 stream 照常交付 —— 这就是解开重组侧队头阻塞的地方。
@@ -171,6 +241,10 @@ type session struct {
 		sync.Mutex
 		rawRecv, rawLost, fecRecovered, nackSent, retransSent uint64
 		authFail                                              uint64
+		// retransMiss:对端 NACK 过来、sendBuf 里却已没有那一片(被淘汰或从未有过)。
+		// abandonedSeq:abandonStaleGapsLocked 放弃掉的、确实没收到的全局 seq 数。
+		retransMiss, abandonedSeq uint64
+		lastMissLog               time.Time
 	}
 	closed chan struct{}
 	// sharedConn:conn 由多个 session 共用(多对端 Server),close 时不能关它。
@@ -220,6 +294,7 @@ func buildSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float
 		groups:     make(map[uint32][][]byte),
 		groupDone:  make(map[uint32]bool),
 		firstSeen:  make(map[uint32]time.Time),
+		nackTries:  make(map[uint32]uint16),
 		streamRecv: make(map[uint32]*streamReasm),
 		deliver:    make(chan streamChunk, 4096),
 		closed:    make(chan struct{}),
@@ -229,6 +304,10 @@ func buildSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float
 		lastFill:  time.Now(),
 	}
 	s.sendBufBudget = sendBufBudgetFor(s.rateBps)
+	// 对端的真实上限本端不知道,拿本端 -rate 顶替:部署上两端 -rate 一致。
+	// 真不一致时窗口只会偏小,最坏退回下限 nackWindow,不比从前差。
+	s.arqMaxRate = s.rateBps / maxShard * float64(k) / float64(k+m)
+	s.nackWin, s.nackBurst = nackWindow, 32
 	s.flushMin = k / groupFlushMinDiv
 	if s.flushMin < 2 {
 		s.flushMin = 2
@@ -251,6 +330,12 @@ func (s *session) startLoops() {
 	go s.retransLoop()
 }
 
+// enableCC 打开拥塞控制:-rate 变成上限,实际速率在 [floorMbps, 上限] 内自动调。
+// 必须在 readLoop 启动前调用。
+func (s *session) enableCC(floorMbps float64) {
+	s.cc = newCongCtl(s.rateBps, floorMbps*1e6/8)
+}
+
 // writePkt 是 session 唯一的发包出口。所有包都从这里出去,
 // 线格式上的统一处理(如鉴权)只需要改这一处。
 func (s *session) writePkt(b []byte) {
@@ -265,9 +350,13 @@ func (s *session) acquire(n int) {
 	for {
 		s.sendMu.Lock()
 		now := time.Now()
-		s.tokens += s.rateBps * now.Sub(s.lastFill).Seconds()
+		rate := s.rateBps
+		if s.cc != nil {
+			rate = s.cc.rate(now)
+		}
+		s.tokens += rate * now.Sub(s.lastFill).Seconds()
 		s.lastFill = now
-		if cap := s.rateBps * 0.1; s.tokens > cap {
+		if cap := rate * 0.1; s.tokens > cap {
 			s.tokens = cap
 		}
 		if s.tokens >= float64(n) {
@@ -275,7 +364,7 @@ func (s *session) acquire(n int) {
 			s.sendMu.Unlock()
 			return
 		}
-		need := (float64(n) - s.tokens) / s.rateBps
+		need := (float64(n) - s.tokens) / rate
 		s.sendMu.Unlock()
 		time.Sleep(time.Duration(need * float64(time.Second)))
 	}
@@ -293,16 +382,22 @@ func (s *session) heartbeatLoop() {
 		case <-s.closed:
 			return
 		case <-t.C:
+			// seq 携带"我已发出的分片总数",对端据此判断是否有尾部丢失。
+			// 必须在 wireMu 内读 nextSeq 并写出,见 wireMu 注释。
+			// 心跳也带上本端 k/m:多对端 Server 靠对端第一个包(往往就是心跳)
+			// 决定用什么 k/m 建会话。旧版接收方不读心跳的这两个字节,线格式兼容。
 			s.wireMu.Lock()
 			s.sendMu.Lock()
 			next := s.nextSeq
 			s.sendMu.Unlock()
-			// seq 携带"我已发出的分片总数",对端据此判断是否有尾部丢失
-			// 心跳也带上本端 k/m:多对端 Server 靠对端第一个包(往往就是心跳)
-			// 决定用什么 k/m 建会话。旧版接收方不读心跳的这两个字节,线格式兼容。
 			header{typ: pktHeartbeat, k: byte(s.k), m: byte(s.m), seq: next, epoch: s.myEpoch}.marshal(buf)
 			s.writePkt(buf)
 			s.wireMu.Unlock()
+
+			// 反馈无条件发:本端开没开拥塞控制,对端都可能要用。老版本对端不认识
+			// 这个类型,onPacket 会直接忽略。
+			header{typ: pktFeedback, seq: s.rxData.Load(), epoch: s.myEpoch}.marshal(buf)
+			s.writePkt(buf)
 		}
 	}
 }
@@ -415,6 +510,7 @@ func (s *session) pushShard(shard []byte) {
 	s.wireMu.Lock()
 	s.writePkt(pkt)
 	s.wireMu.Unlock()
+	s.txData.Add(1)
 
 	if !full {
 		return
@@ -434,6 +530,7 @@ func (s *session) pushShard(shard []byte) {
 		copy(p2[hdrSize:], shards[i])
 		s.acquire(len(p2))
 		s.writePkt(p2)
+		s.txData.Add(1)
 	}
 }
 
@@ -486,20 +583,33 @@ func (s *session) close() {
 //   重传   本端应对端请求发出的重传数
 //   待补   此刻仍在等的 seq 跨度(recvHigh-expected),持续不落零说明有洞补不上
 //   stream 当前有重组状态的 stream 数
+//   重传未命中 对端 NACK 了、本端 sendBuf 里却已没有那一片的次数
+//   放弃   因落后超出缺口窗口而放弃、确实没收到的全局 seq 数
 func (s *session) statsLine() string {
 	s.recvMu.Lock()
 	gap := s.recvHigh - s.expected
 	streams := len(s.streamRecv)
 	s.recvMu.Unlock()
 
+	cc := ""
+	if s.cc != nil {
+		rate, loss, base, active := s.cc.snapshot(time.Now())
+		if active {
+			cc = fmt.Sprintf(" 速率=%.1fMbps 丢包=%.1f%% 本底=%.1f%%", rate*8/1e6, loss*100, base*100)
+		} else {
+			cc = fmt.Sprintf(" 速率=%.1fMbps(无反馈,固定上限)", rate*8/1e6)
+		}
+	}
+
 	s.stats.Lock()
 	defer s.stats.Unlock()
-	line := fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d",
+	line := fmt.Sprintf("收包=%d 缺口=%d FEC恢复=%d NACK=%d 重传=%d 待补=%d stream=%d 重传未命中=%d 放弃=%d",
 		s.stats.rawRecv, s.stats.rawLost, s.stats.fecRecovered,
-		s.stats.nackSent, s.stats.retransSent, gap, streams)
+		s.stats.nackSent, s.stats.retransSent, gap, streams,
+		s.stats.retransMiss, s.stats.abandonedSeq)
 	// 只在启用鉴权时附加:两端密钥不一致时这一项会持续上涨,是最直接的线索
 	if s.auth != nil {
 		line += fmt.Sprintf(" 鉴权失败=%d", s.stats.authFail)
 	}
-	return line
+	return line + cc
 }

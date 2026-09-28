@@ -19,7 +19,8 @@ func main() {
 	lport := flag.Int("lport", 0, "本地 UDP 端口:0=同 uport(两端同端口便于打洞),-1=临时端口(NAT 后的客户端)")
 	k := flag.Int("k", fectun.DefaultK, "FEC 数据分片")
 	m := flag.Int("m", fectun.DefaultM, "FEC 校验分片")
-	rate := flag.Float64("rate", fectun.DefaultRateMbps, "发送限速 Mbps(含冗余),防止把链路打劣")
+	rate := flag.Float64("rate", fectun.DefaultRateMbps, "发送速率上限 Mbps(含冗余);实际速率由拥塞控制在 [-rate-min, -rate] 内自动调")
+	rateMin := flag.Float64("rate-min", 10, "拥塞控制的速率下限 Mbps;设 0 关闭拥塞控制,按 -rate 固定发")
 	key := flag.String("key", "", "预共享密钥,两端必须一致;留空则读环境变量 FECTUN_KEY(避免密钥出现在 ps 里)")
 	flag.Parse()
 
@@ -46,7 +47,7 @@ func main() {
 	conn.SetReadBuffer(16 << 20)
 	conn.SetWriteBuffer(16 << 20)
 	dst := &net.UDPAddr{IP: net.ParseIP(*peer), Port: *uport}
-	opts := fectun.Options{K: *k, M: *m, RateMbps: *rate, Key: []byte(*key)}
+	opts := fectun.Options{K: *k, M: *m, RateMbps: *rate, RateMinMbps: *rateMin, Key: []byte(*key)}
 	auth := "无鉴权"
 	if *key != "" {
 		auth = "PSK 鉴权"
@@ -92,13 +93,13 @@ func main() {
 
 	if multiPeer {
 		// k/m 由各客户端的首包决定,这里的 -k/-m 不起作用
-		fmt.Printf("server 就绪(多对端): FEC/UDP :%d → TCP %s (rate=%.0fMbps/对端, %s)\n",
-			conn.LocalAddr().(*net.UDPAddr).Port, *target, *rate, auth)
+		fmt.Printf("server 就绪(多对端): FEC/UDP :%d → TCP %s (rate=%.0fMbps/对端 rate-min=%.0fMbps, %s)\n",
+			conn.LocalAddr().(*net.UDPAddr).Port, *target, *rate, *rateMin, auth)
 		select {} // 常驻
 	}
 	if *mode == "server" {
-		fmt.Printf("server 就绪: FEC/UDP :%d → TCP %s (k=%d m=%d rate=%.0fMbps, %s)\n",
-			*lport, *target, *k, *m, *rate, auth)
+		fmt.Printf("server 就绪: FEC/UDP :%d → TCP %s (k=%d m=%d rate=%.0fMbps rate-min=%.0fMbps, %s)\n",
+			*lport, *target, *k, *m, *rate, *rateMin, auth)
 		select {} // 常驻
 	}
 
@@ -107,8 +108,8 @@ func main() {
 		fmt.Println("TCP 监听失败:", err)
 		os.Exit(1)
 	}
-	fmt.Printf("client 就绪: TCP %s → FEC/UDP → %s:%d (k=%d m=%d rate=%.0fMbps, %s)\n",
-		*listen, *peer, *uport, *k, *m, *rate, auth)
+	fmt.Printf("client 就绪: TCP %s → FEC/UDP → %s:%d (k=%d m=%d rate=%.0fMbps rate-min=%.0fMbps, %s)\n",
+		*listen, *peer, *uport, *k, *m, *rate, *rateMin, auth)
 	for {
 		c, err := ln.Accept()
 		if err != nil {

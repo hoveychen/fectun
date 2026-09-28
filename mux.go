@@ -144,6 +144,7 @@ func newMuxer(s *session, isServer bool, target string) *muxer {
 	}
 	// 对端重启后序号空间已重置,旧 stream 全部失效,必须清掉
 	s.onReset = m.resetAll
+	s.onStreamDead = m.killStream
 	go m.recvLoop()
 	return m
 }
@@ -462,6 +463,20 @@ func (s *stream) close(notify bool) {
 	// 会拿到一个重置回 0 的 streamSeq,对端排不出它相对于此前数据的顺序。
 	s.mux.sess.forgetStream(s.id)
 	logf("[mux] stream %d 关闭", s.id)
+}
+
+// killStream 断开一条空洞补不回的 stream(见 holeGiveUp),并通知对端一起关。
+// 不在 sess 的回调里同步做:close 会 sendFrame,而那要走发送侧的令牌桶。
+func (m *muxer) killStream(sid uint32) {
+	go func() {
+		logf("[mux] stream %d 有补不回的空洞超过 %s,断开", sid, holeGiveUp)
+		if st := m.lookup(sid); st != nil {
+			st.close(true)
+			return
+		}
+		// 本端已没有这条 stream(比如已先行关闭),对端那侧可能还挂着。
+		m.sendFrame(sid, cmdClose, nil)
+	}()
 }
 
 // client 侧:接受一个本地 TCP 连接,分配 stream

@@ -23,12 +23,27 @@ func logf(format string, args ...any) {
 // RateMbps 是本端发送方向的线路限速(含冗余),净数据 ≈ RateMbps/(1+M/K)。
 // 不要超过链路当时的实际容量 —— 超发只会加剧丢包,实测曾把同机 SSH 挤断。
 //
+// RateMinMbps > 0 时打开拥塞控制:RateMbps 变成上限,实际速率按对端回报的丢包率
+// 在 [RateMinMbps, RateMbps] 内自动调(见 congCtl)。为 0 时按 RateMbps 固定发,
+// 与旧版行为相同。对端是不回反馈的旧版本时也自动退回固定速率。
+//
 // Key 是可选的预共享密钥:非空时每个包带 HMAC 签名,验签失败的包直接丢弃
 // (见 packetAuth)。两端必须一致;为空时线格式与旧版相同。
 type Options struct {
-	K, M     int
-	RateMbps float64
-	Key      []byte
+	K, M        int
+	RateMbps    float64
+	RateMinMbps float64
+	Key         []byte
+}
+
+// startSession 按 Options 建会话。拥塞控制必须在收包开始前打开。
+func startSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, o Options,
+	auth *packetAuth, sharedConn bool) *session {
+	s := newSessionWith(conn, peer, k, m, o.RateMbps, auth, sharedConn)
+	if o.RateMinMbps > 0 {
+		s.enableCC(o.RateMinMbps)
+	}
+	return s
 }
 
 // 与 CLI 默认值保持一致。
@@ -78,7 +93,7 @@ func NewClient(conn *net.UDPConn, peer *net.UDPAddr, o Options) (*Client, error)
 	if err := o.validate(); err != nil {
 		return nil, err
 	}
-	s := newSessionWith(conn, peer, o.K, o.M, o.RateMbps, newPacketAuth(o.Key), false)
+	s := startSession(conn, peer, o.K, o.M, o, newPacketAuth(o.Key), false)
 	go s.readLoop()
 	return &Client{sess: s, mux: newMuxer(s, false, "")}, nil
 }
@@ -154,7 +169,7 @@ func NewPeerServer(conn *net.UDPConn, peer *net.UDPAddr, target string, o Option
 	if err := o.validate(); err != nil {
 		return nil, err
 	}
-	s := newSessionWith(conn, peer, o.K, o.M, o.RateMbps, newPacketAuth(o.Key), false)
+	s := startSession(conn, peer, o.K, o.M, o, newPacketAuth(o.Key), false)
 	go s.readLoop()
 	return &PeerServer{sess: s, mux: newMuxer(s, true, target)}, nil
 }

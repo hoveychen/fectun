@@ -133,7 +133,7 @@ func (s *Server) peerFor(src *net.UDPAddr, first []byte) *serverPeer {
 		return nil
 	}
 	addr := *src
-	sess := newSessionWith(s.conn, &addr, k, m, s.opts.RateMbps, s.auth, true)
+	sess := startSession(s.conn, &addr, k, m, s.opts, s.auth, true)
 	p := &serverPeer{addr: &addr, sess: sess, in: make(chan []byte, serverPeerQueue)}
 	p.mux = newMuxer(sess, true, s.target)
 	s.peers[key] = p

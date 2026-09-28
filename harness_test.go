@@ -1,6 +1,7 @@
 package fectun
 
 import (
+	"io"
 	"encoding/binary"
 	"fmt"
 	"math/rand"
@@ -875,10 +876,10 @@ func TestReceiverStateStaysBoundedUnderLoss(t *testing.T) {
 	close(stop)
 
 	// recvSeen 是最可疑的:它只在 expected 连续推进时才删,没有窗口上限。
-	// nackWindow=4096 是 NACK 扫描的窗口,记账结构理应同阶。
-	if peakSeen > 4*nackWindow {
-		t.Fatalf("recvSeen 峰值 %d 条,远超 nackWindow(%d) 的量级 —— 按全局 seq 的记账失去上限",
-			peakSeen, nackWindow)
+	// NACK 扫描窗口随收包速率缩放,记账结构理应与它可能达到的最大值同阶。
+	if w := int(b.maxNackWin()); peakSeen > 4*w {
+		t.Fatalf("recvSeen 峰值 %d 条,远超缺口窗口上限(%d)的量级 —— 按全局 seq 的记账失去上限",
+			peakSeen, w)
 	}
 }
 
@@ -1013,9 +1014,10 @@ func TestFECCoversPartialGroupUnderLowTraffic(t *testing.T) {
 // (缺口这个指标就此失真)。per-stream 交付把功能影响掩掉了,所以没人发现。
 func TestExpectedAdvancesPastUnfillableHole(t *testing.T) {
 	const k, m = 20, 15
-	// 喂满 400 组 = 8000 个 seq,是 nackWindow(4096) 的近 2 倍,
-	// 足以把"待补无界"和"待补被钉在窗口内"两种行为区分开。
-	const groups = 400
+	// 喂满 1200 组 = 24000 个 seq,是这个 session 缺口窗口上限(rate=100 下约
+	// 11900)的 2 倍,足以把"待补无界"和"待补被钉在窗口内"两种行为区分开。
+	// 同步注入会让实测收包速率瞬间顶到上限,所以必须按上限而不是下限来喂。
+	const groups = 1200
 
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -1066,18 +1068,22 @@ func TestExpectedAdvancesPastUnfillableHole(t *testing.T) {
 	gap := s.recvHigh - s.expected
 	seen := len(s.recvSeen)
 	first := len(s.firstSeen)
+	win := s.nackWin
 	s.recvMu.Unlock()
 
-	if gap > nackWindow {
-		t.Errorf("待补=%d 超出 nackWindow=%d:expected 卡死在填不上的空洞前,"+
-			"NACK 扫描窗口停在死区空转", gap, nackWindow)
+	if fed := uint32(groups * k); fed <= win {
+		t.Fatalf("前置条件不成立:只喂了 %d 个 seq,没超过当前窗口 %d(测试无效)", fed, win)
 	}
-	if seen > nackWindow {
-		t.Errorf("recvSeen=%d 条超出 nackWindow=%d:expected 不推进,"+
-			"记账永不回收 —— 这就是生产上那份随流量线性增长的常驻内存", seen, nackWindow)
+	if gap > win {
+		t.Errorf("待补=%d 超出缺口窗口=%d:expected 卡死在填不上的空洞前,"+
+			"NACK 扫描窗口停在死区空转", gap, win)
 	}
-	if first > nackWindow {
-		t.Errorf("firstSeen=%d 条超出 nackWindow=%d", first, nackWindow)
+	if seen > int(win) {
+		t.Errorf("recvSeen=%d 条超出缺口窗口=%d:expected 不推进,"+
+			"记账永不回收 —— 这就是生产上那份随流量线性增长的常驻内存", seen, win)
+	}
+	if first > int(win) {
+		t.Errorf("firstSeen=%d 条超出缺口窗口=%d", first, win)
 	}
 	// 反向保险:修复不能是"干脆不收包了"。
 	if n := atomic.LoadInt64(&delivered); n == 0 {
@@ -1229,5 +1235,141 @@ func TestFECRecoveryMemoryIsBounded(t *testing.T) {
 		t.Fatalf("FEC 恢复留下常驻内存:每组 %.0f B,%d 组共 %.1f MB 且随恢复次数线性增长 —— "+
 			"照生产上 9 天 23.5 万次恢复的量级,这就是 200 MB 常驻",
 			perRecovery, measured, float64(grown)/1e6)
+	}
+}
+
+// saturate 经 mux 用 4 条 stream 满负载写 dur,返回写入字节数、误判重置次数和首个写错误。
+//
+// 必须走 mux:直接调 writeStream 会绕过流控窗口,接收侧一有缺口重组缓冲就无界
+// 增长 —— 那个版本常驻堆 241 MB,2026-09-28 放到 894 MB 的生产机上跑直接把机器
+// 打爆重启。这些测试只在本机(或容器)里跑。
+func saturate(t *testing.T, rateMbps, ccFloorMbps, burstLoss float64, dur time.Duration) (sent int64, resets int32, werr error) {
+	t.Helper()
+	sink, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("sink listen: %v", err)
+	}
+	defer sink.Close()
+	go func() {
+		for {
+			c, err := sink.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(io.Discard, c); c.Close() }()
+		}
+	}()
+
+	px := newLossyProxy(t, 0, 91)
+	defer px.stop()
+	if burstLoss > 0 {
+		px.setBurst(burstLoss, 200*time.Millisecond)
+	}
+	cli := newTestSession(t, px.port(), 40, 40, rateMbps)
+	srv := newTestSession(t, px.port(), 40, 40, rateMbps)
+	defer cli.close()
+	defer srv.close()
+	if ccFloorMbps > 0 {
+		cli.enableCC(ccFloorMbps)
+		srv.enableCC(ccFloorMbps)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	cliMux := newMuxer(cli, false, "")
+	newMuxer(srv, true, sink.Addr().String())
+	var nReset atomic.Int32
+	for _, s := range []*session{cli, srv} {
+		orig := s.onReset
+		s.onReset = func() { nReset.Add(1); orig() }
+	}
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			cliMux.openStream(c)
+		}
+	}()
+
+	chunk := payload(64 << 10)
+	end := time.Now().Add(dur)
+	var wg sync.WaitGroup
+	var total atomic.Int64
+	var firstErr atomic.Value
+	for i := 0; i < 4; i++ {
+		c, err := net.Dial("tcp", ln.Addr().String())
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		defer c.Close()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(end) && nReset.Load() == 0 {
+				c.SetWriteDeadline(time.Now().Add(8 * time.Second))
+				n, err := c.Write(chunk)
+				total.Add(int64(n))
+				if err != nil {
+					firstErr.CompareAndSwap(nil, err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	t.Logf("rate=%.0f ccFloor=%.0f burst=%.0f%%: %s 写入 %d MB | cli %s | srv %s", rateMbps, ccFloorMbps,
+		burstLoss*100, dur, total.Load()>>20, cli.statsLine(), srv.statsLine())
+	if e, ok := firstErr.Load().(error); ok {
+		werr = e
+	}
+	return total.Load(), nReset.Load(), werr
+}
+
+// 满负载下不得误判对端重置,也不得卡死。
+//
+// 两个历史问题都在这里撞:
+//   - 心跳读完 nextSeq 放锁后才发,被数据片抢先,接收端连续 3 次看到"报低"就误判
+//     对端重置。2026-09-28 实测固定 rate=200、k=m=40 时 2~7 秒必现。
+//   - 固定 rate≥200 时突发丢包压垮 ARQ,缺片在 NACK 到达前就被挤出重传缓冲,
+//     stream 永久挂住。拥塞控制把速率压回链路(这里是 2 核接收端)承载得了的量。
+//
+// 心跳竞态必须用固定速率测:开了拥塞控制会从下限爬坡,满速时间太短,
+// 2026-09-28 变异验证(去掉心跳的 wireMu)时带 CC 的 10 秒 3/3 次照样通过,
+// 固定 200 跑 20 秒则 5 次里 4 次误判重置(竞态是概率性的,抓不住全部)。
+func TestSaturatedFlowDoesNotFalseReset(t *testing.T) {
+	for _, c := range []struct {
+		ccFloor float64
+		dur     time.Duration
+	}{{0, 20 * time.Second}, {10, 10 * time.Second}} {
+		_, resets, err := saturate(t, 200, c.ccFloor, 0, c.dur)
+		if resets != 0 {
+			t.Fatalf("ccFloor=%.0f:对端没有重启,满负载 %s 内却误判了 %d 次重置", c.ccFloor, c.dur, resets)
+		}
+		if err != nil {
+			t.Fatalf("ccFloor=%.0f:写入中途失败:%v —— 隧道卡死或 stream 被断开", c.ccFloor, err)
+		}
+	}
+}
+
+// 验收:突发丢包下,拥塞控制(上限 200)的吞吐不低于原来的固定 rate=50。
+// 丢包模型取评估台的 10%、坏态 200ms。
+func TestCCBeatsFixedRateUnderBurstLoss(t *testing.T) {
+	if testing.Short() {
+		t.Skip("对照实验要跑 20 秒")
+	}
+	fixed, _, ferr := saturate(t, 50, 0, 0.1, 10*time.Second)
+	cc, resets, err := saturate(t, 200, 10, 0.1, 10*time.Second)
+	if ferr != nil {
+		t.Fatalf("固定 rate=50 的对照组就失败了:%v", ferr)
+	}
+	if err != nil || resets != 0 {
+		t.Fatalf("拥塞控制组失败:err=%v resets=%d", err, resets)
+	}
+	if float64(cc) < float64(fixed)*0.95 {
+		t.Fatalf("拥塞控制 %d MB 不如固定 rate=50 的 %d MB", cc>>20, fixed>>20)
 	}
 }
