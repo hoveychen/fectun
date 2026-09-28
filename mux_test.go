@@ -1,6 +1,7 @@
 package main
 
 import (
+	"io"
 	"fmt"
 	"encoding/binary"
 	"net"
@@ -673,4 +674,98 @@ func TestLostShardDoesNotStallOtherStreams(t *testing.T) {
 			" —— stream A 的分片空洞把整条隧道的交付卡住了\n%s",
 			time.Since(start), buf[:n], err, detail)
 	}
+}
+
+// 有积压却超过 holeGiveUp 没推进的 stream 要被清掉;正常推进的、没有积压的不动。
+func TestStuckStreamIsReaped(t *testing.T) {
+	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, 20, 15, 25)
+	defer s.close()
+
+	shard := func(sid, sseq uint32) []byte {
+		b := make([]byte, shardPayload)
+		marshalShard(b, sid, sseq, []byte("x"))
+		return b
+	}
+	s.recvMu.Lock()
+	s.acceptShardLocked(0, shard(5, 1)) // sid 5 缺 sseq 0,积压 1 片
+	s.acceptShardLocked(1, shard(6, 0)) // sid 6 连续,已交付、无积压
+	now := time.Now()
+	early := s.reapStuckStreamsLocked(now.Add(holeGiveUp / 2))
+	late := s.reapStuckStreamsLocked(now.Add(holeGiveUp + time.Second))
+	_, left5 := s.streamRecv[5]
+	_, left6 := s.streamRecv[6]
+	s.recvMu.Unlock()
+
+	if len(early) != 0 {
+		t.Fatalf("还没到 holeGiveUp 就清掉了 %v", early)
+	}
+	if len(late) != 1 || late[0] != 5 || left5 {
+		t.Fatalf("卡住的 sid 5 没被清掉:返回 %v,仍在册=%v", late, left5)
+	}
+	if !left6 {
+		t.Fatal("没有积压的 sid 6 被误清")
+	}
+}
+
+// 空洞永远补不回时(整组数据片连同校验片每次都丢),客户端的 TCP 连接必须被
+// 断开,而不是永久挂住 —— 挂住时上层 ssh 什么都看不到,也不会重连。
+func TestUnrecoverableHoleClosesStream(t *testing.T) {
+	sink, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("sink listen: %v", err)
+	}
+	defer sink.Close()
+	go func() {
+		for {
+			c, err := sink.Accept()
+			if err != nil {
+				return
+			}
+			go func() { io.Copy(io.Discard, c); c.Close() }()
+		}
+	}()
+
+	px := newLossyProxy(t, 0, 61)
+	defer px.stop()
+	// 第 3 组(seq 60~79)的数据片和校验片永远丢,FEC 与 ARQ 都救不回。
+	px.mu.Lock()
+	px.dropEnabled, px.dropFrom, px.dropTo, px.dropTimes = true, 60, 79, 1<<30
+	px.mu.Unlock()
+	cli := newTestSession(t, px.port(), 20, 20, 20)
+	srv := newTestSession(t, px.port(), 20, 20, 20)
+	defer cli.close()
+	defer srv.close()
+	time.Sleep(300 * time.Millisecond)
+	cliMux := newMuxer(cli, false, "")
+	newMuxer(srv, true, sink.Addr().String())
+
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			cliMux.openStream(c)
+		}
+	}()
+	c, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+	go c.Write(payload(1 << 20))
+
+	start := time.Now()
+	c.SetReadDeadline(start.Add(holeGiveUp + 5*time.Second))
+	_, err = c.Read(make([]byte, 1))
+	if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("空洞补不回 %s 后连接仍挂着,没被断开", time.Since(start).Round(time.Second))
+	}
+	t.Logf("%s 后连接被断开:%v", time.Since(start).Round(100*time.Millisecond), err)
 }

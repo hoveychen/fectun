@@ -211,7 +211,7 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 	}
 	r := s.streamRecv[sid]
 	if r == nil {
-		r = &streamReasm{buf: make(map[uint32][]byte)}
+		r = &streamReasm{buf: make(map[uint32][]byte), since: time.Now()}
 		s.streamRecv[sid] = r
 	}
 	if sseq < r.expected {
@@ -226,6 +226,7 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 	// 只取该 stream 连续的部分。别的 stream 有没有空洞,与这里无关 ——
 	// 这一行就是队头阻塞被解开的地方。
 	var ready []streamChunk
+	advanced := false
 	for {
 		d, ok := r.buf[r.expected]
 		if !ok {
@@ -233,9 +234,13 @@ func (s *session) acceptShardLocked(seq uint32, shard []byte) []streamChunk {
 		}
 		delete(r.buf, r.expected)
 		r.expected++
+		advanced = true
 		if len(d) > 0 {
 			ready = append(ready, streamChunk{sid: sid, data: d})
 		}
+	}
+	if advanced {
+		r.since = time.Now()
 	}
 	return ready
 }
@@ -336,8 +341,14 @@ func (s *session) nackLoop() {
 				s.firstSeen[q] = now // 退避后可再次请求
 			}
 		}
+		dead := s.reapStuckStreamsLocked(now)
 		s.recvMu.Unlock()
 
+		if s.onStreamDead != nil {
+			for _, sid := range dead {
+				s.onStreamDead(sid)
+			}
+		}
 		if newGaps > 0 {
 			s.stats.Lock()
 			s.stats.rawLost += uint64(newGaps)
@@ -351,6 +362,19 @@ func (s *session) nackLoop() {
 			s.stats.Unlock()
 		}
 	}
+}
+
+// reapStuckStreamsLocked 找出空洞补不回的 stream(有积压但超过 holeGiveUp
+// 未推进),清掉它们的重组状态并返回其 sid。调用者必须持有 recvMu。
+func (s *session) reapStuckStreamsLocked(now time.Time) []uint32 {
+	var dead []uint32
+	for sid, r := range s.streamRecv {
+		if len(r.buf) > 0 && now.Sub(r.since) > holeGiveUp {
+			dead = append(dead, sid)
+			delete(s.streamRecv, sid)
+		}
+	}
+	return dead
 }
 
 // 对端请求重传。

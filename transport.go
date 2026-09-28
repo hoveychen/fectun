@@ -88,7 +88,19 @@ type streamChunk struct {
 type streamReasm struct {
 	expected uint32            // 下一个待交付的 streamSeq
 	buf      map[uint32][]byte // 乱序先到的分片
+	since    time.Time         // 最近一次推进(或新建)的时刻,见 holeGiveUp
 }
+
+// holeGiveUp:一条 stream 有乱序积压、却这么久都没推进,就判定空洞补不回了。
+//
+// 补不回是真会发生的:突发丢包超过 ARQ 的请求速度时,缺的那片在 NACK 到达前
+// 就被对端挤出了重传缓冲,而 abandonStaleGapsLocked 也会放弃落后太多的全局缺口。
+// 此后这条 stream 永久挂住且不报错 —— 2026-09-28 本机 Docker 实测 rate≥200 必现。
+// 断开它,上层(ssh 等)才会看到连接断了并重连。
+//
+// 标注:5 秒是权衡取的,不是实测值。恶劣链路下多轮重传可能要好几秒,取太短会
+// 误杀还能恢复的连接;取太长则挂死的连接要多等。
+const holeGiveUp = 5 * time.Second
 
 type session struct {
 	conn *net.UDPConn
@@ -101,6 +113,8 @@ type session struct {
 	myEpoch   uint32
 	peerEpoch uint32
 	onReset   func() // 通知上层(mux)关闭所有 stream
+	// onStreamDead 通知上层某条 stream 的空洞补不回了,见 holeGiveUp。
+	onStreamDead func(sid uint32)
 
 	// ---- 发送侧 ----
 	sendMu   sync.Mutex
