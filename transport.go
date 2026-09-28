@@ -26,7 +26,31 @@ const groupKeepWindow = 128
 //
 // 限制窗口不损失能力:ARQ 只需要修补最近的缺口,远处的缺口等 expected 推进
 // 上来后自然进入窗口。
+//
+// 窗口不再是常量,而是随实际收包速率缩放(见 updateARQScaleLocked),这里的
+// nackWindow 只是下限。固定 4096 在 rate=200、k=m=40 下只合 0.4 秒的数据片:
+// 一次几百毫秒的突发坏态就能丢上几千片,缺口还没来得及 NACK 就被当成补不回
+// 放弃掉了,那条 stream 随后被 holeGiveUp 断开 —— 2026-09-28 本机 Docker 实测
+// 10% 突发丢包(坏态均值 200ms)必现。
 const nackWindow = 4096
+
+// nackWindowMax 是缩放后窗口的硬上限:firstSeen/recvSeen 按窗口同阶增长,
+// 65536 条约 2.6 MB,sz 那台 894 MB 的机器扛得住。
+const nackWindowMax = 65536
+
+// nackSpan:缺口窗口覆盖多长时间的数据片。要盖住一次突发坏态加上 NACK 判定、
+// 重传往返与再丢一轮的时间;再长也没用 —— 对端重传缓冲只留约 1 秒(见
+// sendBufBudgetFor),更老的缺口 NACK 了也没人应答。
+const nackSpan = 2 * time.Second
+
+// nackBurstSpan:每个 nackLoop tick 最多发出这么长时间的数据片量的 NACK。
+// 原先写死每 40ms 32 个(800/s),rate=200 时一次突发丢的 2000 片要 2.5 秒才请求
+// 得完,早就超出对端重传缓冲。取两个 tick 的量,让突发后的积压能追上。
+const nackBurstSpan = 80 * time.Millisecond
+
+// arqRateDecay:收包速率估计的衰减时间常数。估计值取"峰值保持、慢衰减"而不是
+// 普通 EWMA —— 突发坏态里收包量会掉到零,而那恰恰是最需要大窗口的时候。
+const arqRateDecay = 3 * time.Second
 
 // lowHbResetStreak:连续多少个心跳报告更低的 nextSeq,才判定对端重置了序号空间。
 //
@@ -176,6 +200,15 @@ type session struct {
 	groupDone map[uint32]bool
 	firstSeen map[uint32]time.Time // seq 缺口首次发现时间,用于 NACK 定时
 
+	// ARQ 随速率缩放的状态,见 updateARQScaleLocked。nackWin/nackBurst 受 recvMu
+	// 保护;arq* 只由 nackLoop 读写(同样在 recvMu 内)。
+	nackWin     uint32  // 当前缺口窗口(seq 数)
+	nackBurst   int     // 当前每 tick 最多发的 NACK 数
+	arqRate     float64 // 数据片 seq 推进速率的估计(个/秒)
+	arqMaxRate  float64 // 本端 -rate 换算出的 seq 速率上限,估计值不超过它
+	arqLastHigh uint32
+	arqLastAt   time.Time
+
 	// streamRecv 是逐 stream 的重组缓冲。一条 stream 的空洞只挡它自己,
 	// 别的 stream 照常交付 —— 这就是解开重组侧队头阻塞的地方。
 	// 堆积量受该 stream 的流控窗口(最大 4 MB)约束,天然有界。
@@ -220,6 +253,10 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 		lastFill:  time.Now(),
 	}
 	s.sendBufBudget = sendBufBudgetFor(s.rateBps)
+	// 对端的真实上限本端不知道,拿本端 -rate 顶替:部署上两端 -rate 一致。
+	// 真不一致时窗口只会偏小,最坏退回下限 nackWindow,不比从前差。
+	s.arqMaxRate = s.rateBps / maxShard * float64(k) / float64(k+m)
+	s.nackWin, s.nackBurst = nackWindow, 32
 	s.flushMin = k / groupFlushMinDiv
 	if s.flushMin < 2 {
 		s.flushMin = 2

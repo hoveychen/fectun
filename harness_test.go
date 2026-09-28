@@ -865,10 +865,10 @@ func TestReceiverStateStaysBoundedUnderLoss(t *testing.T) {
 	close(stop)
 
 	// recvSeen 是最可疑的:它只在 expected 连续推进时才删,没有窗口上限。
-	// nackWindow=4096 是 NACK 扫描的窗口,记账结构理应同阶。
-	if peakSeen > 4*nackWindow {
-		t.Fatalf("recvSeen 峰值 %d 条,远超 nackWindow(%d) 的量级 —— 按全局 seq 的记账失去上限",
-			peakSeen, nackWindow)
+	// NACK 扫描窗口随收包速率缩放,记账结构理应与它可能达到的最大值同阶。
+	if w := int(b.maxNackWin()); peakSeen > 4*w {
+		t.Fatalf("recvSeen 峰值 %d 条,远超缺口窗口上限(%d)的量级 —— 按全局 seq 的记账失去上限",
+			peakSeen, w)
 	}
 }
 
@@ -1003,9 +1003,10 @@ func TestFECCoversPartialGroupUnderLowTraffic(t *testing.T) {
 // (缺口这个指标就此失真)。per-stream 交付把功能影响掩掉了,所以没人发现。
 func TestExpectedAdvancesPastUnfillableHole(t *testing.T) {
 	const k, m = 20, 15
-	// 喂满 400 组 = 8000 个 seq,是 nackWindow(4096) 的近 2 倍,
-	// 足以把"待补无界"和"待补被钉在窗口内"两种行为区分开。
-	const groups = 400
+	// 喂满 1200 组 = 24000 个 seq,是这个 session 缺口窗口上限(rate=100 下约
+	// 11900)的 2 倍,足以把"待补无界"和"待补被钉在窗口内"两种行为区分开。
+	// 同步注入会让实测收包速率瞬间顶到上限,所以必须按上限而不是下限来喂。
+	const groups = 1200
 
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	if err != nil {
@@ -1056,18 +1057,22 @@ func TestExpectedAdvancesPastUnfillableHole(t *testing.T) {
 	gap := s.recvHigh - s.expected
 	seen := len(s.recvSeen)
 	first := len(s.firstSeen)
+	win := s.nackWin
 	s.recvMu.Unlock()
 
-	if gap > nackWindow {
-		t.Errorf("待补=%d 超出 nackWindow=%d:expected 卡死在填不上的空洞前,"+
-			"NACK 扫描窗口停在死区空转", gap, nackWindow)
+	if fed := uint32(groups * k); fed <= win {
+		t.Fatalf("前置条件不成立:只喂了 %d 个 seq,没超过当前窗口 %d(测试无效)", fed, win)
 	}
-	if seen > nackWindow {
-		t.Errorf("recvSeen=%d 条超出 nackWindow=%d:expected 不推进,"+
-			"记账永不回收 —— 这就是生产上那份随流量线性增长的常驻内存", seen, nackWindow)
+	if gap > win {
+		t.Errorf("待补=%d 超出缺口窗口=%d:expected 卡死在填不上的空洞前,"+
+			"NACK 扫描窗口停在死区空转", gap, win)
 	}
-	if first > nackWindow {
-		t.Errorf("firstSeen=%d 条超出 nackWindow=%d", first, nackWindow)
+	if seen > int(win) {
+		t.Errorf("recvSeen=%d 条超出缺口窗口=%d:expected 不推进,"+
+			"记账永不回收 —— 这就是生产上那份随流量线性增长的常驻内存", seen, win)
+	}
+	if first > int(win) {
+		t.Errorf("firstSeen=%d 条超出缺口窗口=%d", first, win)
 	}
 	// 反向保险:修复不能是"干脆不收包了"。
 	if n := atomic.LoadInt64(&delivered); n == 0 {
@@ -1305,8 +1310,8 @@ func saturate(t *testing.T, rateMbps, ccFloorMbps, burstLoss float64, dur time.D
 		}()
 	}
 	wg.Wait()
-	t.Logf("rate=%.0f ccFloor=%.0f burst=%.0f%%: %s 写入 %d MB | cli %s", rateMbps, ccFloorMbps,
-		burstLoss*100, dur, total.Load()>>20, cli.statsLine())
+	t.Logf("rate=%.0f ccFloor=%.0f burst=%.0f%%: %s 写入 %d MB | cli %s | srv %s", rateMbps, ccFloorMbps,
+		burstLoss*100, dur, total.Load()>>20, cli.statsLine(), srv.statsLine())
 	if e, ok := firstErr.Load().(error); ok {
 		werr = e
 	}

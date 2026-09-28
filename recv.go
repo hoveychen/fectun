@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"time"
 )
 
@@ -260,7 +261,7 @@ func (s *session) advanceExpectedLocked() {
 	}
 }
 
-// abandonStaleGapsLocked 把 expected 强行推到 recvHigh-nackWindow,放弃那之前
+// abandonStaleGapsLocked 把 expected 强行推到 recvHigh-nackWin,放弃那之前
 // 一切还没到的 seq。调用者必须持有 recvMu。
 //
 // 为什么必须放弃:落后超过 nackWindow 的空洞已经不可能再补上。一是对端的
@@ -279,10 +280,10 @@ func (s *session) advanceExpectedLocked() {
 // (归属信息在载荷里,载荷本身丢了)。受影响的那条 stream 由它自己的重组队列
 // 挡着,与全局 expected 无关 —— 这里放弃的只是全局记账,不是交付。
 func (s *session) abandonStaleGapsLocked() {
-	if s.recvHigh <= nackWindow {
+	if s.recvHigh <= s.nackWin {
 		return
 	}
-	floor := s.recvHigh - nackWindow
+	floor := s.recvHigh - s.nackWin
 	for ; s.expected < floor; s.expected++ {
 		delete(s.recvSeen, s.expected)
 		delete(s.firstSeen, s.expected)
@@ -315,17 +316,18 @@ func (s *session) nackLoop() {
 		case <-t.C:
 		}
 		s.recvMu.Lock()
+		now := time.Now()
+		s.updateARQScaleLocked(now)
 		high := s.recvHigh
-		// 窗口上限:对端 seq 再高也只扫最近 nackWindow 个,否则单端重启时
+		// 窗口上限:对端 seq 再高也只扫最近 nackWin 个,否则单端重启时
 		// 这个循环会一次性给 firstSeen 建几百万条目(见 nackWindow 注释)。
-		if high > s.expected+nackWindow {
-			high = s.expected + nackWindow
+		if high > s.expected+s.nackWin {
+			high = s.expected + s.nackWin
 		}
 		var want []uint32
 		newGaps := 0
-		now := time.Now()
 		// 开区间:q < high。recvHigh==0 时循环不执行,空载不会误发 NACK。
-		for q := s.expected; q < high && len(want) < 32; q++ {
+		for q := s.expected; q < high && len(want) < s.nackBurst; q++ {
 			if s.recvSeen[q] {
 				continue
 			}
@@ -362,6 +364,40 @@ func (s *session) nackLoop() {
 			s.stats.Unlock()
 		}
 	}
+}
+
+// updateARQScaleLocked 按实测的数据片 seq 推进速率,重算缺口窗口 nackWin 与
+// 每 tick 的 NACK 上限 nackBurst。调用者必须持有 recvMu,且只由 nackLoop 调用。
+//
+// 用 recvHigh 的推进量而不是 rxData:rxData 连校验片一起数,而窗口和 NACK
+// 都是按数据片 seq 算的,k=m 时两者差一倍。
+// 估计值封顶在 arqMaxRate:recvHigh 会被心跳或同步注入一下顶高几千,
+// 不封顶的话一个 tick 就能把窗口拉到上限。
+func (s *session) updateARQScaleLocked(now time.Time) {
+	cur := s.recvHigh
+	if !s.arqLastAt.IsZero() {
+		dt := now.Sub(s.arqLastAt).Seconds()
+		var inst float64
+		if cur >= s.arqLastHigh && dt > 0 {
+			inst = float64(cur-s.arqLastHigh) / dt
+		}
+		if inst > s.arqMaxRate {
+			inst = s.arqMaxRate
+		}
+		s.arqRate = math.Max(inst, s.arqRate*math.Exp(-dt/arqRateDecay.Seconds()))
+	}
+	s.arqLastHigh, s.arqLastAt = cur, now
+
+	win := s.arqRate * nackSpan.Seconds()
+	s.nackWin = uint32(math.Min(math.Max(win, nackWindow), nackWindowMax))
+	burst := s.arqRate * nackBurstSpan.Seconds()
+	s.nackBurst = int(math.Min(math.Max(burst, 32), 4096))
+}
+
+// maxNackWin 是本 session 的缺口窗口可能达到的最大值(测试用来对照)。
+func (s *session) maxNackWin() uint32 {
+	w := s.arqMaxRate * nackSpan.Seconds()
+	return uint32(math.Min(math.Max(w, nackWindow), nackWindowMax))
 }
 
 // reapStuckStreamsLocked 找出空洞补不回的 stream(有积压但超过 holeGiveUp
