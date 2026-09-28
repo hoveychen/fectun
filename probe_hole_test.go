@@ -275,3 +275,60 @@ func sortedDur(d []time.Duration) []time.Duration {
 	}
 	return out
 }
+
+// hole-diag P2 复现:线上 [diag] 显示被断开的 stream 都是"缺 1 片、NACK 0 次、
+// 停滞 ≥5s"。假设:停滞从最后一次推进算起,空闲过 holeGiveUp 的 stream 一出空洞
+// 就在下一个 tick 被判死,NACK 根本来不及发。
+func TestProbeIdleStreamHoleReapedInstantly(t *testing.T) {
+	c, _ := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	s := newSession(c, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}, 20, 15, 25)
+	defer s.close()
+	shard := func(sid, sseq uint32) []byte {
+		b := make([]byte, shardPayload)
+		marshalShard(b, sid, sseq, []byte("x"))
+		return b
+	}
+	s.recvMu.Lock()
+	s.acceptShardLocked(0, shard(7, 0)) // 正常交付,随后空闲
+	s.streamRecv[7].since = time.Now().Add(-6 * time.Second)
+	s.acceptShardLocked(2, shard(7, 2)) // 空闲 6s 后来数据:sseq 1 丢了,2 先到
+	dead := s.reapStuckStreamsLocked(time.Now())
+	s.recvMu.Unlock()
+	if len(dead) != 0 {
+		t.Fatalf("空洞刚出现就被判死:%v —— 停滞从最后一次推进算起,空闲的 stream 没有任何补洞时间", dead)
+	}
+}
+
+func TestProbeIdleStreamHoleEndToEnd(t *testing.T) {
+	px := newLossyProxy(t, 0, 1)
+	defer px.stop()
+	cli := newTestSession(t, px.port(), 40, 40, 50)
+	srv := newTestSession(t, px.port(), 40, 40, 50)
+	defer cli.close()
+	defer srv.close()
+	var kills atomic.Int32
+	srv.onStreamDead = func(uint32) { kills.Add(1) }
+	time.Sleep(300 * time.Millisecond)
+
+	cli.writeStream(9, []byte("hello")) // sseq 0
+	if got := collect(srv, 5, 2*time.Second); len(got) != 5 {
+		t.Fatalf("前置条件:首片没到 (%d B)", len(got))
+	}
+	time.Sleep(holeGiveUp + time.Second) // ssh 空闲
+
+	cli.sendMu.Lock()
+	next := cli.nextSeq
+	cli.sendMu.Unlock()
+	px.mu.Lock()
+	px.dropEnabled, px.dropFrom, px.dropTo, px.dropTimes = true, next, next, 1 // 只丢首发,重传放行
+	px.mu.Unlock()
+	cli.writeStream(9, []byte("AAAA")) // sseq 1:首发被丢
+	cli.writeStream(9, []byte("BBBB")) // sseq 2:先到
+	got := collect(srv, 8, 3*time.Second)
+	if kills.Load() != 0 {
+		t.Fatalf("空闲后只丢 1 片(重传可达)就被 holeGiveUp 断开了 %d 次;收到 %q", kills.Load(), got)
+	}
+	if string(got) != "AAAABBBB" {
+		t.Fatalf("数据不对:%q", got)
+	}
+}
