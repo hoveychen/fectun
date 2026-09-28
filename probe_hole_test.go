@@ -149,22 +149,27 @@ func TestProbeHoleUnderAsymLoss(t *testing.T) {
 	defer pc.Close()
 	pport := pc.LocalAddr().(*net.UDPAddr).Port
 
-	cli := newTestSession(t, pport, 40, 40, rate)
-	srv := newTestSession(t, pport, 40, 40, rate)
+	withCC := func(s *session) {
+		if floor > 0 {
+			s.enableCC(floor)
+		}
+	}
+	cli := newTunedTestSession(t, 0, pport, 40, 40, rate, withCC)
+	srv := newTunedTestSession(t, 0, pport, 40, 40, rate, withCC)
+	px.mu.Lock()
 	px.lossySrc = srv.conn.LocalAddr().String()
+	px.mu.Unlock()
 	defer cli.close()
 	defer srv.close()
-	if floor > 0 {
-		cli.enableCC(floor)
-		srv.enableCC(floor)
-	}
 	time.Sleep(300 * time.Millisecond)
 	cliMux := newMuxer(cli, false, "")
 	newMuxer(srv, true, tgt.Addr().String())
 	var kills atomic.Int32
 	for _, s := range []*session{cli, srv} {
+		s.recvMu.Lock()
 		orig := s.onStreamDead
-		s.onStreamDead = func(sid uint32) { kills.Add(1); orig(sid) }
+		s.recvMu.Unlock()
+		s.setOnStreamDead(func(sid uint32) { kills.Add(1); orig(sid) })
 	}
 
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")

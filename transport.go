@@ -150,6 +150,7 @@ type session struct {
 	peerEpoch uint32
 	onReset   func() // 通知上层(mux)关闭所有 stream
 	// onStreamDead 通知上层某条 stream 的空洞补不回了,见 holeGiveUp。
+	// 受 recvMu 保护(用 setOnStreamDead 设置)。
 	onStreamDead func(sid uint32)
 
 	// ---- 发送侧 ----

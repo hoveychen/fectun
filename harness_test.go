@@ -1265,14 +1265,16 @@ func saturate(t *testing.T, rateMbps, ccFloorMbps, burstLoss float64, dur time.D
 	if burstLoss > 0 {
 		px.setBurst(burstLoss, 200*time.Millisecond)
 	}
-	cli := newTestSession(t, px.port(), 40, 40, rateMbps)
-	srv := newTestSession(t, px.port(), 40, 40, rateMbps)
+	// 拥塞控制必须在 readLoop 起来前打开,见 enableCC。
+	withCC := func(s *session) {
+		if ccFloorMbps > 0 {
+			s.enableCC(ccFloorMbps)
+		}
+	}
+	cli := newTunedTestSession(t, 0, px.port(), 40, 40, rateMbps, withCC)
+	srv := newTunedTestSession(t, 0, px.port(), 40, 40, rateMbps, withCC)
 	defer cli.close()
 	defer srv.close()
-	if ccFloorMbps > 0 {
-		cli.enableCC(ccFloorMbps)
-		srv.enableCC(ccFloorMbps)
-	}
 	time.Sleep(300 * time.Millisecond)
 
 	cliMux := newMuxer(cli, false, "")

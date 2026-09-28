@@ -111,11 +111,12 @@ func TestCCIgnoresPeerCounterReset(t *testing.T) {
 func TestCCMeasuresRealLinkLoss(t *testing.T) {
 	px := newLossyProxy(t, 0.2, 7)
 	defer px.stop()
-	cli := newTestSession(t, px.port(), 20, 20, 20)
+	cli := newTunedTestSession(t, 0, px.port(), 20, 20, 20, func(s *session) {
+		s.cc = newCongCtl(s.rateBps, 10*mbps) // 必须在 readLoop 起来前挂上
+	})
 	srv := newTestSession(t, px.port(), 20, 20, 20)
 	defer cli.close()
 	defer srv.close()
-	cli.cc = newCongCtl(cli.rateBps, 10*mbps)
 	time.Sleep(300 * time.Millisecond)
 
 	go func() {

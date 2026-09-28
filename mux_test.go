@@ -146,9 +146,9 @@ func startBlackhole(t *testing.T) (addr string, stop func()) {
 // 每条"连上就断"的连接都留下一条 stream —— 40 分钟内新建 4306 条、关闭仅 1680 条,
 // 积压 2626 条,每条带 2 个 goroutine(约 16 KB 栈),把 RSS 顶到 46 MB 且不回落。
 func TestHalfClosedStreamIsReclaimed(t *testing.T) {
-	old := halfCloseLinger
-	halfCloseLinger = 600 * time.Millisecond
-	defer func() { halfCloseLinger = old }()
+	old := halfCloseLinger.Load()
+	halfCloseLinger.Store(int64(600 * time.Millisecond))
+	defer halfCloseLinger.Store(old)
 
 	bhAddr, stopBH := startBlackhole(t)
 	defer stopBH()
@@ -744,7 +744,7 @@ func TestIdleStreamHoleIsRepairedEndToEnd(t *testing.T) {
 	defer cli.close()
 	defer srv.close()
 	var kills atomic.Int32
-	srv.onStreamDead = func(uint32) { kills.Add(1) }
+	srv.setOnStreamDead(func(uint32) { kills.Add(1) })
 	time.Sleep(300 * time.Millisecond)
 
 	cli.writeStream(9, []byte("hello")) // sseq 0
