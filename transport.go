@@ -103,6 +103,12 @@ type session struct {
 
 	// ---- 发送侧 ----
 	sendMu   sync.Mutex
+	// wireMu 让心跳的"读 nextSeq + 写出"与数据片的写出互斥。否则心跳读完
+	// nextSeq、还没写出时,数据 goroutine 已把 seq ≥ 该值的分片发了出去,
+	// 对端就看到心跳低于 recvHigh。满速时约 13% 的心跳如此,连续 3 个即被
+	// lowHbResetStreak 判成序号重置,平均约 50 秒无故断一次全部 stream。
+	// 只包 WriteToUDP,不包限速等待,所以心跳最多等一次 syscall。
+	wireMu sync.Mutex
 	nextSeq  uint32
 	curGroup   []([]byte) // 当前 FEC 组累积的数据分片
 	curGroupAt time.Time  // 本组第一片的入组时刻,用于超时 flush
@@ -274,6 +280,7 @@ func (s *session) heartbeatLoop() {
 		case <-s.closed:
 			return
 		case <-t.C:
+			s.wireMu.Lock()
 			s.sendMu.Lock()
 			next := s.nextSeq
 			s.sendMu.Unlock()
@@ -282,6 +289,7 @@ func (s *session) heartbeatLoop() {
 			// 决定用什么 k/m 建会话。旧版接收方不读心跳的这两个字节,线格式兼容。
 			header{typ: pktHeartbeat, k: byte(s.k), m: byte(s.m), seq: next, epoch: s.myEpoch}.marshal(buf)
 			s.writePkt(buf)
+			s.wireMu.Unlock()
 		}
 	}
 }
@@ -391,7 +399,9 @@ func (s *session) pushShard(shard []byte) {
 		group: group, seq: seq, epoch: s.myEpoch}.marshal(pkt)
 	copy(pkt[hdrSize:], shard)
 	s.acquire(len(pkt))
+	s.wireMu.Lock()
 	s.writePkt(pkt)
+	s.wireMu.Unlock()
 
 	if !full {
 		return
