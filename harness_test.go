@@ -1325,13 +1325,22 @@ func saturate(t *testing.T, rateMbps, ccFloorMbps, burstLoss float64, dur time.D
 //     对端重置。2026-09-28 实测固定 rate=200、k=m=40 时 2~7 秒必现。
 //   - 固定 rate≥200 时突发丢包压垮 ARQ,缺片在 NACK 到达前就被挤出重传缓冲,
 //     stream 永久挂住。拥塞控制把速率压回链路(这里是 2 核接收端)承载得了的量。
+//
+// 心跳竞态必须用固定速率测:开了拥塞控制会从下限爬坡,满速时间太短,
+// 2026-09-28 变异验证(去掉心跳的 wireMu)时带 CC 的 10 秒 3/3 次照样通过,
+// 固定 200 跑 20 秒则 5 次里 4 次误判重置(竞态是概率性的,抓不住全部)。
 func TestSaturatedFlowDoesNotFalseReset(t *testing.T) {
-	_, resets, err := saturate(t, 200, 10, 0, 10*time.Second)
-	if resets != 0 {
-		t.Fatalf("对端没有重启,满负载 10 秒内却误判了 %d 次重置", resets)
-	}
-	if err != nil {
-		t.Fatalf("写入中途失败:%v —— 隧道卡死或 stream 被断开", err)
+	for _, c := range []struct {
+		ccFloor float64
+		dur     time.Duration
+	}{{0, 20 * time.Second}, {10, 10 * time.Second}} {
+		_, resets, err := saturate(t, 200, c.ccFloor, 0, c.dur)
+		if resets != 0 {
+			t.Fatalf("ccFloor=%.0f:对端没有重启,满负载 %s 内却误判了 %d 次重置", c.ccFloor, c.dur, resets)
+		}
+		if err != nil {
+			t.Fatalf("ccFloor=%.0f:写入中途失败:%v —— 隧道卡死或 stream 被断开", c.ccFloor, err)
+		}
 	}
 }
 
