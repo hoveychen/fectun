@@ -210,13 +210,24 @@ func newTestSession(t *testing.T, proxyPort, k, m int, rate float64) *session {
 // newTestSessionOn 可指定本地端口。localPort=0 表示随机。
 // 重启场景必须复用同一端口 —— 真实部署中服务重启后 UDP 端口不变。
 func newTestSessionOn(t *testing.T, localPort, proxyPort, k, m int, rate float64) *session {
+	return newTunedTestSession(t, localPort, proxyPort, k, m, rate, nil)
+}
+
+// newTunedTestSession 在后台协程起来之前调用 tune 改可调字段,
+// 协程起来后再改就是数据竞争。
+func newTunedTestSession(t *testing.T, localPort, proxyPort, k, m int, rate float64,
+	tune func(*session)) *session {
 	t.Helper()
 	c, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: localPort})
 	if err != nil {
 		t.Fatalf("session bind: %v", err)
 	}
 	peer := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: proxyPort}
-	s := newSession(c, peer, k, m, rate)
+	s := buildSession(c, peer, k, m, rate, nil, false)
+	if tune != nil {
+		tune(s)
+	}
+	s.startLoops()
 	go s.readLoop()
 	return s
 }

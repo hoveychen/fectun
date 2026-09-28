@@ -187,6 +187,16 @@ func newSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64
 // 定下来 —— 心跳协程一起来就会读 auth。
 func newSessionWith(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64,
 	auth *packetAuth, sharedConn bool) *session {
+	s := buildSession(conn, peer, k, m, rateMbps, auth, sharedConn)
+	s.startLoops()
+	return s
+}
+
+// buildSession 只建结构、不起后台协程。拆出来是给测试一个窗口:
+// flushMin / retransCopies / asyncRetrans 这些可调字段在协程里无锁读取,
+// 只能在 startLoops 之前改。
+func buildSession(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps float64,
+	auth *packetAuth, sharedConn bool) *session {
 	// 必须关掉逆矩阵缓存 —— 它是 reedsolomon 里唯一一处只插不删、没有容量上限的
 	// 结构。缓存按"本组缺了哪几片"的索引组合做 key 存求好的逆矩阵:每个树节点带
 	// k+m 个 children 指针,叶子再挂一个 k×k 矩阵。这在 RAID 场景是划算的(坏的是
@@ -231,11 +241,14 @@ func newSessionWith(conn *net.UDPConn, peer *net.UDPAddr, k, m int, rateMbps flo
 		s.myEpoch = 1
 	}
 	s.tokens = s.rateBps * 0.05
+	return s
+}
+
+func (s *session) startLoops() {
 	go s.heartbeatLoop()
 	go s.nackLoop()
 	go s.groupFlushLoop()
 	go s.retransLoop()
-	return s
 }
 
 // writePkt 是 session 唯一的发包出口。所有包都从这里出去,

@@ -17,6 +17,11 @@ jobs:
         run: go vet ./...
       - name: build
         run: go build ./...
-      # 测试含并发与丢包模拟,-race 用于捕获状态机上的竞态
+      # 测试含并发与丢包模拟,-race 用于捕获状态机上的竞态。
+      # 库包带 -short:fecparam_test.go 是只打表、不断言的评估台,
+      # race 下每个要跑几分钟,全跑会顶破超时。
       - name: test (race)
-        run: go test -race -count=1 -timeout 10m ./...
+        run: go test -race -count=1 -short -timeout 10m .
+      # CLI 的进程级集成测试在 -short 下会跳过,单独全量跑
+      - name: test cli (race)
+        run: go test -race -count=1 -timeout 10m ./cmd/...

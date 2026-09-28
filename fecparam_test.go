@@ -3,6 +3,7 @@ package fectun
 import (
 	"fmt"
 	"math/rand"
+	"sync"
 	"testing"
 	"time"
 )
@@ -171,6 +172,8 @@ func TestLowRateLatency(t *testing.T) {
 		b := newTestSession(t, p.port(), pm.k, pm.m, 25)
 		time.Sleep(400 * time.Millisecond)
 
+		// sentAt 两头之间只隔着 UDP,race 检测器看不见这层先后,得上锁
+		var sentMu sync.Mutex
 		sentAt := make([]time.Time, msgs)
 		done := make(chan []time.Duration, 1)
 		go func() {
@@ -179,7 +182,10 @@ func TestLowRateLatency(t *testing.T) {
 			for got < msgs {
 				select {
 				case <-b.deliver:
-					lat = append(lat, time.Since(sentAt[got]))
+					sentMu.Lock()
+					at := sentAt[got]
+					sentMu.Unlock()
+					lat = append(lat, time.Since(at))
 					got++
 				case <-time.After(5 * time.Second):
 					done <- lat
@@ -189,7 +195,9 @@ func TestLowRateLatency(t *testing.T) {
 			done <- lat
 		}()
 		for i := 0; i < msgs; i++ {
+			sentMu.Lock()
 			sentAt[i] = time.Now()
+			sentMu.Unlock()
 			a.writeStream(1, payload(msgSize))
 			time.Sleep(interval)
 		}
@@ -516,16 +524,14 @@ func runInteractiveN(t *testing.T, k, m int, seed int64, tune func(*session), ms
 	)
 	p := newLossyProxy(t, 0, seed)
 	p.setBurst(0.44, 200*time.Millisecond)
-	a := newTestSession(t, p.port(), k, m, 25)
+	a := newTunedTestSession(t, 0, p.port(), k, m, 25, tune)
 	b := newTestSession(t, p.port(), k, m, 25)
-	if tune != nil {
-		tune(a)
-	}
 	time.Sleep(400 * time.Millisecond)
 	p.mu.Lock()
 	p.seen = 0 // 不计握手期的心跳
 	p.mu.Unlock()
 
+	var sentMu sync.Mutex
 	sentAt := make([]time.Time, msgs)
 	done := make(chan []time.Duration, 1)
 	go func() {
@@ -533,7 +539,10 @@ func runInteractiveN(t *testing.T, k, m int, seed int64, tune func(*session), ms
 		for len(lat) < msgs {
 			select {
 			case <-b.deliver:
-				lat = append(lat, time.Since(sentAt[len(lat)]))
+				sentMu.Lock()
+				at := sentAt[len(lat)]
+				sentMu.Unlock()
+				lat = append(lat, time.Since(at))
 			case <-time.After(15 * time.Second):
 				done <- lat
 				return
@@ -543,7 +552,9 @@ func runInteractiveN(t *testing.T, k, m int, seed int64, tune func(*session), ms
 	}()
 	start := time.Now()
 	for i := 0; i < msgs; i++ {
+		sentMu.Lock()
 		sentAt[i] = time.Now()
+		sentMu.Unlock()
 		a.writeStream(1, payload(msgSize))
 		time.Sleep(interval)
 	}
